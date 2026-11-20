@@ -109,7 +109,7 @@ final class DesktopPage {
                     if (closed) return;
                     CookieManager.getInstance().setCookie(ORIGIN, sessionCookie, stored -> {
                         if (closed) return;
-                        if (Boolean.TRUE.equals(stored)) view.loadUrl(ORIGIN + "/");
+                        if (Boolean.TRUE.equals(stored)) view.loadUrl(ORIGIN + "/?companion=android");
                         else unavailable.run();
                     });
                 });

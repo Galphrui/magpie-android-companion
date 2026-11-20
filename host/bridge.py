@@ -29,6 +29,9 @@ HOST, PORT = "127.0.0.1", 43425
 BROWSER_PORT = 43427
 BROWSER_SESSION = "/companion-browser/session"
 BROWSER_COOKIE = "__Host-magpie_companion"
+ANDROID_ASSETS = Path(__file__).resolve().parent.parent / "app/src/main/assets"
+ANDROID_STYLE = "/companion-android/magpie-landscape.css"
+ANDROID_SCRIPT = "/companion-android/magpie-interaction.js"
 EVENTS, COMMANDS = "/companion/v1/events", "/companion/v1/commands"
 STATE, SETTINGS = "/api/state?last=1", "/api/settings"
 CONCURRENCY, TRACE = "/v1/magpie/concurrency", "/v1/magpie/trace"
@@ -681,7 +684,8 @@ class BrowserHandler(BridgeHandler):
         if ("\\" in path or "//" in path or any(part in (".", "..") for part in path.split("/"))
                 or any(ord(char) < 32 for char in path)):
             return self._reply(400, "invalidRequest")
-        if "k" in parse_qs(url.query.replace(";", "&"), keep_blank_values=True):
+        query = parse_qs(url.query.replace(";", "&"), keep_blank_values=True)
+        if "k" in query:
             return self._reply(400, "invalidRequest")
         reading = self.command in ("GET", "HEAD")
         lengths = self.headers.get_all("Content-Length", [])
@@ -699,6 +703,16 @@ class BrowserHandler(BridgeHandler):
             return self._open_session()
         if not plugin_asset and not self._has_session():
             return self._reply(401, "unauthorized")
+        if reading and path in (ANDROID_STYLE, ANDROID_SCRIPT):
+            content_type = "text/css" if path == ANDROID_STYLE else "text/javascript"
+            try:
+                body = (ANDROID_ASSETS / Path(path).name).read_bytes()
+            except OSError:
+                return self._reply(404, "notFound")
+            self._headers(200, content_type + "; charset=utf-8", len(body))
+            if self.command != "HEAD":
+                self.wfile.write(body)
+            return
         api = path.startswith("/api/")
         static = reading and (path == "/" or bool(re.fullmatch(
             r"/(?:(?:icons|plugins)/(?:[^/]+/)*)?[^/]+\.(?:html|css|m?js|json|webmanifest|svg|png|ico|webp|jpg|jpeg|woff2?|ttf|avif)",
@@ -709,6 +723,11 @@ class BrowserHandler(BridgeHandler):
             return self._reply(403, "crossOrigin")
 
         headers = {key: self.headers[key] for key in self.request_headers if key in self.headers}
+        android_page = reading and path in ("/", "/index.html") and query.get("companion") == ["android"]
+        if android_page:
+            for key in ("If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Range", "Range"):
+                headers.pop(key, None)
+            headers["Accept-Encoding"] = "identity"
         headers.update({"Host": client_host, "Connection": "close"})
         if not plugin_asset:
             headers["Cookie"] = self.server.adapter.cookie
@@ -731,11 +750,22 @@ class BrowserHandler(BridgeHandler):
             return self._reply(502, "desktopUnavailable")
         with response:
             try:
-                self._relay_response(response)
+                patched = None
+                if (android_page and self.command == "GET" and response.status == 200
+                        and response.headers.get_content_type() == "text/html"
+                        and response.headers.get("Content-Encoding", "identity") == "identity"):
+                    page = response.read((1 << 20) + 1)
+                    if len(page) > (1 << 20):
+                        return self._reply(502, "desktopUnavailable")
+                    script = f'<script src="{ANDROID_SCRIPT}"></script>'.encode()
+                    style = f'<link rel="stylesheet" href="{ANDROID_STYLE}">'.encode()
+                    patched = re.sub(rb"<head(?:\s[^>]*)?>", lambda match: match[0] + script, page, count=1, flags=re.I)
+                    patched = re.sub(rb"</head\s*>", lambda match: style + match[0], patched, count=1, flags=re.I)
+                self._relay_response(response, patched)
             finally:
                 upstream.close()
 
-    def _relay_response(self, response):
+    def _relay_response(self, response, patched=None):
         self.send_response(response.status)
         connection_options = {
             option.strip().lower()
@@ -746,6 +776,8 @@ class BrowserHandler(BridgeHandler):
             key = name.lower()
             if key in self.blocked_response_headers or key in connection_options or key.startswith("access-control-"):
                 continue
+            if patched is not None and key in ("content-length", "etag", "last-modified", "accept-ranges"):
+                continue
             if key == "location":
                 location = urlsplit(value)
                 if location.netloc in (self.server.client_host, f"{HOST}:{self.server.adapter.web_port}"):
@@ -754,10 +786,14 @@ class BrowserHandler(BridgeHandler):
                     continue
             if key != "content-length" or not response.chunked:
                 self.send_header(name, value)
+        if patched is not None:
+            self.send_header("Content-Length", str(len(patched)))
         self.send_header("Connection", "close")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        if self.command != "HEAD":
+        if patched is not None:
+            self.wfile.write(patched)
+        elif self.command != "HEAD":
             while part := response.read1(64 << 10):
                 self.wfile.write(part)
 

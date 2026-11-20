@@ -11,17 +11,25 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.os.Bundle;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
-import android.view.WindowInsets;
+import android.view.Window;
 import android.view.WindowManager;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowCompat;
+import androidx.core.view.WindowInsetsCompat;
+import androidx.core.view.WindowInsetsControllerCompat;
 import java.text.DateFormat;
 import java.util.Date;
 import javax.net.ssl.HttpsURLConnection;
@@ -52,6 +60,7 @@ public final class MainActivity extends Activity {
     private int bg, surface, text, muted, border, selected, green;
     private AlertDialog activeDialog;
     private DesktopPage desktop;
+    private TextView desktopSettings;
     private BridgeClient attemptedDesktop;
     private boolean summarySelected, desktopFailed;
 
@@ -61,6 +70,8 @@ public final class MainActivity extends Activity {
         super.onCreate(state);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
         if (state != null) { page = Math.max(0, Math.min(PAGES.length - 1, state.getInt("page"))); scrollY = state.getInt("scroll"); summarySelected = state.getBoolean("summary"); }
+        getWindow().setAttributes(cutoutLayout(getWindow().getAttributes()));
+        WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
         loadPairing(); applyOrientation(); makeLayout(); paint(false);
     }
     private void loadPairing() {
@@ -78,6 +89,10 @@ public final class MainActivity extends Activity {
     @Override protected void onPause() { resumed = false; if (desktop != null) desktop.view.onPause(); if (activeDialog != null) activeDialog.dismiss(); super.onPause(); }
     @Override protected void onStop() { active = false; stopStream(); live = false; super.onStop(); }
     @Override protected void onDestroy() { closeDesktop(); super.onDestroy(); }
+    @Override public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) applySystemBars(getWindow());
+    }
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
         if (request == DesktopPage.PICK_FILES && desktop != null) desktop.filePickerResult(result, data);
@@ -96,7 +111,13 @@ public final class MainActivity extends Activity {
         }
     }
     @Override public void onConfigurationChanged(Configuration config) {
-        super.onConfigurationChanged(config); if (!active || desktop != null) return;
+        super.onConfigurationChanged(config);
+        if (desktop != null) {
+            placeDesktopSettings(config);
+            ViewCompat.requestApplyInsets((View) desktop.view.getParent());
+            return;
+        }
+        if (!active) return;
         if (scroll != null) scrollY = scroll.getScrollY(); displayKey = ""; makeLayout(); paint(false);
     }
     private int orientation() { return getPreferences(MODE_PRIVATE).getInt("orientation", 0); }
@@ -121,18 +142,37 @@ public final class MainActivity extends Activity {
         attemptedDesktop = paired; desktopFailed = false; summarySelected = false;
         stopStream();
         desktop = new DesktopPage(this, paired, () -> showSummary(true));
-        LinearLayout frame = column(); frame.setBackgroundColor(bg); fitSystemBars(frame);
-        LinearLayout top = row(); padding(top, 12, 0);
-        top.addView(label("Magpie · USB", 14, text, true), new LinearLayout.LayoutParams(0, -2, 1));
-        top.addView(button("手机设置", false, () -> showSummary(false)), lp(-2, -2));
-        frame.addView(top, lp(-1, -2)); divider(frame);
-        frame.addView(desktop.view, new LinearLayout.LayoutParams(-1, 0, 1));
+        FrameLayout frame = new FrameLayout(this);
+        frame.setBackgroundColor(bg);
+        fitSystemBars(frame);
+        frame.addView(desktop.view, new FrameLayout.LayoutParams(-1, -1));
+        desktopSettings = button("手机", false, this::displayDialog);
+        desktopSettings.setContentDescription("手机设置");
+        desktopSettings.setMinHeight(dp(44));
+        frame.addView(desktopSettings);
+        placeDesktopSettings(getResources().getConfiguration());
         setContentView(frame);
+        applySystemBars(getWindow());
         desktop.open();
+    }
+    private void placeDesktopSettings(Configuration config) {
+        boolean shortLandscape = config.orientation == Configuration.ORIENTATION_LANDSCAPE
+                && config.screenWidthDp >= 520 && config.screenHeightDp <= 560;
+        FrameLayout.LayoutParams settings = new FrameLayout.LayoutParams(dp(44), dp(44));
+        settings.gravity = shortLandscape ? Gravity.BOTTOM | Gravity.LEFT : Gravity.TOP | Gravity.RIGHT;
+        if (shortLandscape) {
+            settings.leftMargin = dp(7);
+            settings.bottomMargin = dp(5);
+        } else {
+            settings.rightMargin = dp(4);
+            settings.topMargin = dp(2);
+        }
+        desktopSettings.setLayoutParams(settings);
     }
     private void closeDesktop() {
         if (desktop == null) return;
         DesktopPage previous = desktop; desktop = null;
+        desktopSettings = null;
         previous.close();
     }
     private void showSummary(boolean failed) {
@@ -186,22 +226,51 @@ public final class MainActivity extends Activity {
         b.setBackground(new RippleDrawable(ColorStateList.valueOf(muted), shape(on ? selected : surface, on ? border : Color.TRANSPARENT, 9), shape(Color.WHITE, Color.TRANSPARENT, 9)));
         b.setFocusable(true); b.setOnClickListener(v -> action.run()); return b;
     }
-    private void fitSystemBars(View view) {
-        if (android.os.Build.VERSION.SDK_INT >= 30) {
-            getWindow().setDecorFitsSystemWindows(false);
-            view.setOnApplyWindowInsetsListener((v, insets) -> {
-                android.graphics.Insets safe = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
-                v.setPadding(safe.left, safe.top, safe.right, safe.bottom);
-                return insets;
-            });
+    private WindowManager.LayoutParams cutoutLayout(WindowManager.LayoutParams params) {
+        if (Build.VERSION.SDK_INT >= 30) {
+            params.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+        } else if (Build.VERSION.SDK_INT >= 28) {
+            params.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
         }
+        return params;
+    }
+    private void applySystemBars(Window window) {
+        boolean dark = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
+        window.setStatusBarColor(bg);
+        window.setNavigationBarColor(bg);
+        WindowInsetsControllerCompat controller = WindowCompat.getInsetsController(window, window.getDecorView());
+        controller.setAppearanceLightStatusBars(!dark);
+        controller.setAppearanceLightNavigationBars(!dark);
+        controller.setSystemBarsBehavior(WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+        int visible = visibleBarTypes();
+        int hidden = WindowInsetsCompat.Type.systemBars() & ~visible;
+        if (visible != 0) controller.show(visible);
+        if (hidden != 0) controller.hide(hidden);
+    }
+    private int visibleBarTypes() {
+        int visible = 0;
+        if (getPreferences(MODE_PRIVATE).getBoolean("showStatusBar", false)) visible |= WindowInsetsCompat.Type.statusBars();
+        if (getPreferences(MODE_PRIVATE).getBoolean("showNavigationBar", false)) visible |= WindowInsetsCompat.Type.navigationBars();
+        return visible;
+    }
+    private void fitSystemBars(View view) {
+        ViewCompat.setOnApplyWindowInsetsListener(view, (v, insets) -> {
+            // Some Android 10 builds report a stable status-bar inset when it is hidden.
+            Insets safe = insets.getInsets(visibleBarTypes()
+                    | WindowInsetsCompat.Type.displayCutout() | WindowInsetsCompat.Type.ime());
+            v.setPadding(safe.left, safe.top, safe.right, safe.bottom);
+            return WindowInsetsCompat.CONSUMED;
+        });
+        view.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override public void onViewAttachedToWindow(View v) { ViewCompat.requestApplyInsets(v); }
+            @Override public void onViewDetachedFromWindow(View v) { }
+        });
     }
     private void makeLayout() {
         boolean dark = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
         bg = rgb(dark ? "#1A1A1E" : "#F4F4F6"); surface = rgb(dark ? "#222227" : "#FFFFFF"); text = rgb(dark ? "#F1F1F4" : "#24242A");
         muted = rgb(dark ? "#AEAEB9" : "#5E5E6B"); border = rgb(dark ? "#3A3A43" : "#DEDEE5"); selected = rgb(dark ? "#37373E" : "#E7E7ED"); green = rgb(dark ? "#8BD7AC" : "#226342");
         wide = getResources().getConfiguration().screenWidthDp >= 680; root = column(); root.setBackgroundColor(bg);
-        getWindow().setStatusBarColor(bg); getWindow().setNavigationBarColor(bg); getWindow().getDecorView().setSystemUiVisibility(dark ? 0 : View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
         fitSystemBars(root);
         LinearLayout top = row(); padding(top, 14, 4); top.addView(label("magpie", 20, text, true), new LinearLayout.LayoutParams(0, -2, 1));
         connection = button(live ? transportName() + " 已连接" : "USB 未连接", false, this::pairDialog); connection.setMaxLines(2); top.addView(connection, lp(-2, -2)); root.addView(top, lp(-1, -2)); divider(root);
@@ -210,7 +279,7 @@ public final class MainActivity extends Activity {
         if (wide) { middle.addView(nav, lp(dp(166), -1)); View line = new View(this); line.setBackgroundColor(border); middle.addView(line, lp(dp(1), -1)); }
         scroll = new ScrollView(this); scroll.setFillViewport(true); scroll.setClipToPadding(false); content = column(); padding(content, wide ? 24 : 15, 14); scroll.addView(content, new ScrollView.LayoutParams(-1, -2));
         middle.addView(scroll, wide ? new LinearLayout.LayoutParams(0, -1, 1) : lp(-1, -1)); if (!wide) { divider(root); root.addView(nav, lp(-1, -2)); }
-        setContentView(root); drawNav();
+        setContentView(root); applySystemBars(getWindow()); drawNav();
     }
     private void drawNav() {
         nav.removeAllViews(); for (int i = 0; i < PAGES.length; i++) { final int dest = i;
@@ -262,10 +331,39 @@ public final class MainActivity extends Activity {
         }
         JSONObject settings = section("settings"); LinearLayout card = panel(); int index = currencyIndex(settings.optString("currency")); entry(card, "电脑用量货币", index >= 0 ? CURRENCY_NAMES[index] : "未报告", text);
         if (canWrite()) card.addView(button("更改电脑用量货币", true, this::currencyDialog), lp(-1, -2)); else note(commandPending ? "正在等待电脑确认。" : "要更改货币，请在电脑端以允许写入模式启动同步桥。");
-        LinearLayout device = panel(); device.addView(button("屏幕方向 · " + ORIENTATIONS[orientation()], false, this::orientationDialog), lp(-1, -2)); divider(device); device.addView(button(paired == null ? "USB 未连接" : "管理局域网配对", false, this::pairDialog), lp(-1, -2));
+        LinearLayout device = panel(); device.addView(button("屏幕与系统栏", false, this::displayDialog), lp(-1, -2)); divider(device); device.addView(button(paired == null ? "USB 未连接" : "管理局域网配对", false, this::pairDialog), lp(-1, -2));
+    }
+    private void displayDialog() {
+        LinearLayout options = column();
+        padding(options, 20, 8);
+        options.addView(button("屏幕方向 · " + ORIENTATIONS[orientation()], false, () -> {
+            activeDialog.dismiss();
+            orientationDialog();
+        }), lp(-1, -2));
+        addBarOption(options, "显示状态栏", "showStatusBar");
+        addBarOption(options, "显示系统导航栏", "showNavigationBar");
+        AlertDialog.Builder dialog = new AlertDialog.Builder(this).setTitle("手机设置")
+                .setView(options).setPositiveButton("完成", null);
+        if (desktop != null) dialog.setNeutralButton("连接与摘要", (d, w) -> showSummary(false));
+        activeDialog = dialog.create();
+        activeDialog.setOnDismissListener(d -> { if (activeDialog == d) activeDialog = null; });
+        activeDialog.show();
+        if (activeDialog.getWindow() != null) applySystemBars(activeDialog.getWindow());
+    }
+    private void addBarOption(LinearLayout options, String title, String preference) {
+        Switch toggle = new Switch(this);
+        toggle.setText(title);
+        toggle.setMinHeight(dp(44));
+        toggle.setChecked(getPreferences(MODE_PRIVATE).getBoolean(preference, false));
+        toggle.setOnCheckedChangeListener((view, checked) -> {
+            getPreferences(MODE_PRIVATE).edit().putBoolean(preference, checked).apply();
+            applySystemBars(getWindow());
+            if (activeDialog != null && activeDialog.getWindow() != null) applySystemBars(activeDialog.getWindow());
+        });
+        options.addView(toggle, lp(-1, -2));
     }
     private void orientationDialog() {
-        activeDialog = new AlertDialog.Builder(this).setTitle("屏幕方向").setSingleChoiceItems(ORIENTATIONS, orientation(), (dialog, which) -> { getPreferences(MODE_PRIVATE).edit().putInt("orientation", which).apply(); dialog.dismiss(); activeDialog = null; applyOrientation(); paint(true); })
+        activeDialog = new AlertDialog.Builder(this).setTitle("屏幕方向").setSingleChoiceItems(ORIENTATIONS, orientation(), (dialog, which) -> { getPreferences(MODE_PRIVATE).edit().putInt("orientation", which).apply(); dialog.dismiss(); applyOrientation(); if (desktop == null) paint(true); })
                 .setNegativeButton("取消", null).create(); activeDialog.setOnDismissListener(dialog -> activeDialog = null); activeDialog.show();
     }
     private void pairDialog() {
@@ -273,10 +371,16 @@ public final class MainActivity extends Activity {
         address.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS); address.setText(pairedOrigin); address.setSaveEnabled(false); address.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
         EditText input = new EditText(this); input.setHint("局域网电脑配对码（USB 无需输入）"); input.setSingleLine(true); input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         input.setSaveEnabled(false); input.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO); LinearLayout holder = column(); padding(holder, 20, 6); holder.addView(address, lp(-1, -2)); holder.addView(input, lp(-1, -2));
+        holder.setFocusableInTouchMode(true);
+        holder.requestFocus();
         AlertDialog.Builder builder = new AlertDialog.Builder(this).setTitle("局域网配对").setMessage("USB 在 Mac 上授权后自动连接，无需手工配对。此处仅用于电脑不在同一 USB 环境时的私有局域网配对。")
                 .setView(holder).setPositiveButton("配对局域网电脑", null).setNegativeButton("关闭", null);
         if (paired != null && !pairedOrigin.contains("127.0.0.1")) builder.setNeutralButton("解除配对", (d, w) -> { PairingStore.clear(this); paired = null; pairedOrigin = "https://127.0.0.1:43425"; snapshot = null; sampledAt = 0; displayKey = ""; connect(); });
         activeDialog = builder.create(); activeDialog.setOnDismissListener(d -> activeDialog = null); activeDialog.show();
+        if (activeDialog.getWindow() != null) {
+            activeDialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
+                    | WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        }
         activeDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> { try { String origin = address.getText().toString().trim(), code = input.getText().toString().trim(); new BridgeClient(code, origin); PairingStore.save(this, code, origin); input.getText().clear(); activeDialog.dismiss(); paired = new BridgeClient(code, origin); pairedOrigin = origin; snapshot = null; sampledAt = 0; displayKey = ""; connect(); }
             catch (IllegalArgumentException e) { input.setError("地址或配对码不正确。请使用 HTTPS 和可信私网地址。"); } catch (Exception e) { input.setError("无法安全保存配对。请检查设备安全芯片并重试。"); } });
     }

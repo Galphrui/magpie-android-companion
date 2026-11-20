@@ -26,6 +26,15 @@ class FixtureHandler(BaseHTTPRequestHandler):
     def respond(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         self.server.requests.append((self.command, self.path, dict(self.headers), body))
+        if self.path.startswith("/?companion=android"):
+            payload = b"<html><head><script src='boot.js'></script></head><body></body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("ETag", "unmodified")
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if self.path == "/api/stream":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -155,6 +164,24 @@ class BrowserBridgeTests(unittest.TestCase):
         _, headers, _ = self.request("/api/foreign-link", headers=session)
         self.assertIsNone(headers["Location"])
         self.assertEqual([r[1] for r in self.upstream.requests], ["/api/missing", "/api/link", "/api/foreign-link"])
+
+    def test_android_document_loads_companion_assets_before_app(self):
+        page = "/?companion=android"
+        self.assertEqual(self.request(page)[0], 401)
+        self.assertEqual(self.request(bridge.ANDROID_SCRIPT)[0], 401)
+        session = self.sign_in()
+        status, headers, html = self.request(page, headers={**session, "Accept-Encoding": "gzip"})
+        self.assertEqual(status, 200)
+        self.assertLess(html.index(bridge.ANDROID_SCRIPT.encode()), html.index(b"boot.js"))
+        self.assertIn(bridge.ANDROID_STYLE.encode(), html)
+        self.assertEqual(int(headers["Content-Length"]), len(html))
+        self.assertIsNone(headers["ETag"])
+        self.assertEqual(self.upstream.requests[-1][2]["Accept-Encoding"], "identity")
+        for path, kind in ((bridge.ANDROID_SCRIPT, "text/javascript"), (bridge.ANDROID_STYLE, "text/css")):
+            status, headers, body = self.request(path, headers=session)
+            self.assertEqual(status, 200)
+            self.assertEqual(headers["Content-Type"], kind + "; charset=utf-8")
+            self.assertTrue(body)
 
     def test_plugin_assets_use_upstream_capability_path(self):
         status, _, _ = self.request(PLUGIN_ASSET, headers={"Sec-Fetch-Site": "cross-site"})

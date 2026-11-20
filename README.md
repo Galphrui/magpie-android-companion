@@ -1,5 +1,6 @@
 # Magpie Android Companion
 
+最近发现Magpie真的是一个神仙项目，越用越上头，想着做一个外接扩展屏专门放这玩意。后边转念一想，我本身就是做Android的，刚好家里还有不用的旧手机，直接把功能移植手机版多好。说干就干，借助AI简直事半功倍。
 这是 [yetone/magpie](https://github.com/yetone/magpie) 的独立 Android 伴侣项目。Mac 上运行上游 Magpie，Android 通过 USB 打开同一台 Mac 提供的 Web 管理界面。上游 Magpie 由 yetone 和贡献者维护，采用 [MIT 许可证](https://github.com/yetone/magpie/blob/main/LICENSE)。本仓库包含 Android 客户端和 Mac 桥接代码。
 
 ## 功能
@@ -37,3 +38,6 @@ python3 -B -m unittest discover -s tools -q
 ```
 
 真机安装正式版并启动 USB 桥接后，可用 `python3 -B tools/device_browser_check.py` 检查完整界面的冷启动和用量页。
+## 后续
+
+接下来首先会在windows上试运行，然后补充功能。可能会添加远程的功能，彻底实现设备端控制终端。不过可能涉及搭建服务器什么的，再议吧。各位大佬有什么好的想法或者补充欢迎完善。

@@ -17,3 +17,4 @@ local.properties
 /signing/*.jks
 /signing/*.keystore
 /signing/*.key
+.idea

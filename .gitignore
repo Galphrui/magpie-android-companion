@@ -1,20 +1,33 @@
+# Build and IDE output
+.gradle/
+.kotlin/
+.idea/
 *.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
+build/
+captures/
+.externalNativeBuild/
+.cxx/
 .DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
 local.properties
-/signing/*.p12
-/signing/*.jks
-/signing/*.keystore
-/signing/*.key
-.idea
+*.apk
+*.aab
+
+# Python and local logs
+__pycache__/
+*.py[cod]
+*.log
+
+# Local development records and machine-specific setup
+/doc/
+/tools/真机环境配置.md
+/tools/验收修复循环.md
+
+# Keep only the public verification certificate
+/signing/*
+!/signing/magpie-galph-release-cert.pem
+*.p12
+*.jks
+*.keystore
+*.key
+.env
+.env.*

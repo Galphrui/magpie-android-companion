@@ -1,0 +1,4 @@
+# Bleak 2.1.1 supports Windows 10; Bleak 3.x requires Windows 11.
+bleak==2.1.1
+cryptography>=44
+qrcode>=7.4,<9

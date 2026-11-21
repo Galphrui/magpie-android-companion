@@ -19,6 +19,6 @@ class ExampleInstrumentedTest {
     fun useAppContext() {
         // Context of the app under test.
         val appContext = InstrumentationRegistry.getInstrumentation().targetContext
-        assertEquals("com.ruiao.magpie", appContext.packageName)
+        assertEquals("com.ruiao.magpie.companion.galph.debug", appContext.packageName)
     }
 }

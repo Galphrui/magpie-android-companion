@@ -1,9 +1,13 @@
 package com.ruiao.magpie;
 
-import android.app.Activity;
+import android.Manifest;
 import android.app.AlertDialog;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothManager;
+import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
+import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
@@ -14,7 +18,9 @@ import android.os.Bundle;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.text.InputType;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
 import android.view.Window;
@@ -25,23 +31,31 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
+import androidx.activity.ComponentActivity;
+import androidx.activity.OnBackPressedCallback;
+import android.widget.Toast;
 import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
+import java.io.IOException;
 import java.text.DateFormat;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 import javax.net.ssl.HttpsURLConnection;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-public final class MainActivity extends Activity {
+public final class MainActivity extends ComponentActivity {
     private static final String[] PAGES = {"智能体", "网关", "路由", "设置"};
     private static final String[] GLYPHS = {"◈", "◎", "⋔", "⚙"};
     private static final String[] CURRENCIES = {"usd", "cny", "provider"};
     private static final String[] CURRENCY_NAMES = {"美元（USD）", "人民币（CNY）", "随供应商"};
     private static final String[] ORIENTATIONS = {"横屏（默认）", "竖屏", "跟随系统"};
+    private static final int SCAN_BLUETOOTH = 516, ENABLE_BLUETOOTH = 517, BLUETOOTH_PERMISSIONS = 518;
+    private static final String USE_BLUETOOTH = "useBluetooth";
     private static BridgeClient paired;
     private static String pairedOrigin = "https://127.0.0.1:43425";
     private static boolean commandPending;
@@ -63,32 +77,325 @@ public final class MainActivity extends Activity {
     private TextView desktopSettings;
     private BridgeClient attemptedDesktop;
     private boolean summarySelected, desktopFailed;
+    private BluetoothPairing pendingBluetooth, tunnelPairing;
+    private BluetoothPairing bluetoothPairingRecord;
+    private BluetoothTunnel bluetoothTunnel;
+    private int bluetoothGeneration;
+    private int bluetoothStartupRetries;
+    private long bluetoothPairingStartedAt;
+    private boolean bluetoothPairingConnected;
+    private Runnable bluetoothPairingExpiry, bluetoothRetryTask;
+    private String bluetoothStatus = "蓝牙未连接";
+    private boolean scanAfterBluetoothReady;
 
     @Override protected void onCreate(Bundle state) {
         boolean night = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
         setTheme(night ? android.R.style.Theme_Material_NoActionBar : android.R.style.Theme_Material_Light_NoActionBar);
         super.onCreate(state);
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override public void handleOnBackPressed() {
+                if (desktop == null) {
+                    setEnabled(false);
+                    try {
+                        getOnBackPressedDispatcher().onBackPressed();
+                    } finally {
+                        setEnabled(true);
+                    }
+                } else if (desktop.view.canGoBack()) {
+                    desktop.view.goBack();
+                } else {
+                    showSummary(false);
+                }
+            }
+        });
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
-        if (state != null) { page = Math.max(0, Math.min(PAGES.length - 1, state.getInt("page"))); scrollY = state.getInt("scroll"); summarySelected = state.getBoolean("summary"); }
+        if (state != null) {
+            page = Math.max(0, Math.min(PAGES.length - 1, state.getInt("page")));
+            scrollY = state.getInt("scroll");
+            summarySelected = state.getBoolean("summary");
+            scanAfterBluetoothReady = state.getBoolean("scanAfterBluetoothReady");
+        }
         getWindow().setAttributes(cutoutLayout(getWindow().getAttributes()));
         WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
         loadPairing(); applyOrientation(); makeLayout(); paint(false);
     }
     private void loadPairing() {
+        if (usesBluetooth()) {
+            BluetoothPairing bluetooth = selectedBluetooth();
+            if (bluetooth == null) {
+                paired = null;
+                pairedOrigin = BluetoothPairing.ORIGIN;
+                bluetoothStatus = "请扫描电脑端的蓝牙配对二维码";
+            } else {
+                usePairing(bluetooth.code, BluetoothPairing.ORIGIN);
+            }
+            return;
+        }
         PairingStore.Pairing saved = PairingStore.load(this);
         if (saved == null) { paired = null; pairedOrigin = UsbPairingProvider.USB_ORIGIN; return; }
-        if (paired != null && pairedOrigin.equals(saved.origin) && paired.matchesPairing(saved.code)) return;
-        try { paired = new BridgeClient(saved.code, saved.origin); pairedOrigin = saved.origin; }
-        catch (Exception ignored) { PairingStore.clear(this); paired = null; pairedOrigin = UsbPairingProvider.USB_ORIGIN; }
+        usePairing(saved.code, saved.origin);
+    }
+    private boolean usesBluetooth() {
+        return pendingBluetooth != null || getPreferences(MODE_PRIVATE).getBoolean(USE_BLUETOOTH, false);
+    }
+    private BluetoothPairing selectedBluetooth() {
+        return pendingBluetooth != null ? pendingBluetooth : PairingStore.loadBluetooth(this);
+    }
+    private boolean hasBluetoothPermissions() {
+        return Build.VERSION.SDK_INT < 31
+                || checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED
+                && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
+    }
+    private void prepareBluetooth(boolean scan) {
+        scanAfterBluetoothReady = scan;
+        if (!hasBluetoothPermissions()) {
+            requestPermissions(new String[] {Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_CONNECT},
+                    BLUETOOTH_PERMISSIONS);
+            return;
+        }
+        continueBluetoothAction();
+    }
+    private void continueBluetoothAction() {
+        BluetoothManager manager = getSystemService(BluetoothManager.class);
+        BluetoothAdapter adapter = manager == null ? null : manager.getAdapter();
+        if (adapter == null || !getPackageManager().hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE)) {
+            showConnectionMessage("这台手机不支持低功耗蓝牙");
+            return;
+        }
+        try {
+            if (!adapter.isEnabled()) {
+                startActivityForResult(new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE), ENABLE_BLUETOOTH);
+            } else if (scanAfterBluetoothReady) {
+                Intent scanner = new Intent(this, BluetoothScanActivity.class)
+                        .putExtra(BluetoothScanActivity.VISIBLE_BARS, visibleBarTypes());
+                startActivityForResult(scanner, SCAN_BLUETOOTH);
+            } else {
+                clearBluetoothRecord();
+                pendingBluetooth = null;
+                getPreferences(MODE_PRIVATE).edit().putBoolean(USE_BLUETOOTH, true).apply();
+                resetConnection();
+            }
+        } catch (ActivityNotFoundException | SecurityException error) {
+            showConnectionMessage("请在 Android 设置中开启蓝牙并授予附近设备权限");
+        }
+    }
+    @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (requestCode != BLUETOOTH_PERMISSIONS) return;
+        if (hasBluetoothPermissions()) continueBluetoothAction();
+        else showConnectionMessage("连接电脑需要允许在附近查找和连接设备");
+    }
+    private void startBluetooth() {
+        startBluetooth(true);
+    }
+    private void startBluetooth(boolean resetRetries) {
+        BluetoothPairing pairing = selectedBluetooth();
+        if (pairing == null) return;
+        beginBluetoothRecord(pairing, resetRetries);
+        if (!scheduleBluetoothPairingExpiry(pairing)) return;
+        if (pairing.sameAs(tunnelPairing) && bluetoothTunnel != null && !bluetoothTunnel.isClosed()) return;
+        stopBluetooth();
+        if (!hasBluetoothPermissions()) {
+            bluetoothStatus = "蓝牙权限未授予，请在连接方式中重试";
+            return;
+        }
+        bluetoothStatus = "正在启动蓝牙配对";
+        int generation = bluetoothGeneration;
+        try {
+            bluetoothTunnel = BluetoothTunnel.start(this, pairing.serviceId, pairing.token(),
+                    message -> {
+                        if (generation != bluetoothGeneration) return;
+                        bluetoothStatus = message;
+                        // A tunnel can fail before a peer connects, so no connection
+                        // callback is emitted. Reclaim that closed instance and retry
+                        // with the same QR instead of leaving the UI permanently stuck.
+                        if (bluetoothTunnel != null && bluetoothTunnel.isClosed()) {
+                            bluetoothTunnel = null;
+                            tunnelPairing = null;
+                            if (active && usesBluetooth() && !bluetoothPairingConnected
+                                    && bluetoothStartupRetries < BluetoothPairing.MAX_STARTUP_RETRIES
+                                    && bluetoothRetryTask == null) {
+                                int attempt = ++bluetoothStartupRetries;
+                                long delay = BluetoothPairing.startupRetryDelay(attempt);
+                                bluetoothRetryTask = () -> {
+                                    bluetoothRetryTask = null;
+                                    if (active && generation == bluetoothGeneration && bluetoothTunnel == null
+                                            && usesBluetooth() && pairing.sameAs(bluetoothPairingRecord)) {
+                                        startBluetooth(false);
+                                    }
+                                };
+                                ui.postDelayed(bluetoothRetryTask, delay);
+                            } else if (bluetoothStartupRetries >= BluetoothPairing.MAX_STARTUP_RETRIES) {
+                                bluetoothStatus = "蓝牙服务启动失败，请重新扫描二维码或稍后重试";
+                            }
+                        }
+                        if (active && desktop == null && (bluetoothTunnel == null || !bluetoothTunnel.isPaired())) {
+                            updateLink(false, bluetoothStatus);
+                        }
+                    },
+                    connected -> onBluetoothState(generation, pairing, connected));
+            tunnelPairing = pairing;
+        } catch (IOException | SecurityException error) {
+            bluetoothStatus = error.getMessage() == null ? "无法开启蓝牙配对" : error.getMessage();
+        }
+    }
+
+    private void beginBluetoothRecord(BluetoothPairing pairing, boolean resetRetries) {
+        if (bluetoothPairingRecord == null || !bluetoothPairingRecord.sameAs(pairing)) {
+            clearBluetoothRecord();
+            bluetoothPairingRecord = pairing;
+            bluetoothPairingStartedAt = SystemClock.elapsedRealtime();
+        }
+        if (resetRetries) {
+            bluetoothStartupRetries = 0;
+            if (bluetoothRetryTask != null) {
+                ui.removeCallbacks(bluetoothRetryTask);
+                bluetoothRetryTask = null;
+            }
+        }
+        if (bluetoothPairingConnected) clearBluetoothPairingExpiry();
+    }
+
+    private boolean scheduleBluetoothPairingExpiry(BluetoothPairing pairing) {
+        if (bluetoothPairingRecord == null || !pairing.sameAs(bluetoothPairingRecord)
+                || bluetoothPairingConnected) return true;
+        clearBluetoothPairingExpiry();
+        long remaining = BluetoothPairing.RECORD_TTL_MS
+                - (SystemClock.elapsedRealtime() - bluetoothPairingStartedAt);
+        if (remaining <= 0) {
+            expireBluetoothRecord(pairing);
+            return false;
+        }
+        bluetoothPairingExpiry = () -> expireBluetoothRecord(pairing);
+        ui.postDelayed(bluetoothPairingExpiry, remaining);
+        return true;
+    }
+
+    private void expireBluetoothRecord(BluetoothPairing target) {
+        if (bluetoothPairingRecord == null || !target.sameAs(bluetoothPairingRecord)
+                || bluetoothPairingConnected) return;
+        if (target.sameAs(pendingBluetooth)) pendingBluetooth = null;
+        BluetoothPairing saved = PairingStore.loadBluetooth(this);
+        if (target.sameAs(saved)) PairingStore.clearBluetooth(this);
+        clearBluetoothRecord();
+        stopBluetooth();
+        loadPairing();
+        bluetoothStatus = "蓝牙二维码已过期，请扫描电脑端当前二维码";
+        attemptedDesktop = null;
+        if (active) connect();
+    }
+
+    private void clearBluetoothPairingExpiry() {
+        if (bluetoothPairingExpiry != null) {
+            ui.removeCallbacks(bluetoothPairingExpiry);
+            bluetoothPairingExpiry = null;
+        }
+    }
+
+    private void clearBluetoothRecord() {
+        clearBluetoothPairingExpiry();
+        if (bluetoothRetryTask != null) {
+            ui.removeCallbacks(bluetoothRetryTask);
+            bluetoothRetryTask = null;
+        }
+        bluetoothPairingRecord = null;
+        bluetoothPairingStartedAt = 0;
+        bluetoothPairingConnected = false;
+        bluetoothStartupRetries = 0;
+    }
+    private void onBluetoothState(int generation, BluetoothPairing pairing, boolean connected) {
+        if (generation != bluetoothGeneration || !usesBluetooth()) return;
+        if (connected) {
+            bluetoothStatus = "蓝牙已连接电脑";
+            bluetoothPairingConnected = true;
+            clearBluetoothPairingExpiry();
+            bluetoothStartupRetries = 0;
+            if (pairing.sameAs(pendingBluetooth)) {
+                try {
+                    PairingStore.saveBluetooth(this, pairing);
+                    getPreferences(MODE_PRIVATE).edit().putBoolean(USE_BLUETOOTH, true).apply();
+                    pendingBluetooth = null;
+                } catch (Exception error) {
+                    showConnectionMessage("蓝牙已连接，但手机未能保存配对");
+                }
+            }
+        } else {
+            clearBluetoothRecord();
+            boolean stalePairing = pairing.sameAs(pendingBluetooth);
+            if (stalePairing) pendingBluetooth = null;
+            BluetoothPairing saved = PairingStore.loadBluetooth(this);
+            if (pairing.sameAs(saved)) {
+                PairingStore.clearBluetooth(this);
+                stalePairing = true;
+            }
+            if (stalePairing) {
+                stopBluetooth();
+                loadPairing();
+            }
+            bluetoothStatus = stalePairing
+                    ? "蓝牙配对已失效，请扫描电脑端当前二维码"
+                    : "蓝牙连接已断开，请检查电脑端状态";
+        }
+        attemptedDesktop = null;
+        if (active) connect();
+    }
+    private void stopBluetooth() {
+        bluetoothGeneration++;
+        BluetoothTunnel old = bluetoothTunnel;
+        bluetoothTunnel = null;
+        tunnelPairing = null;
+        if (old != null) old.close();
+    }
+    private void useUsbOrLan() {
+        clearBluetoothRecord();
+        pendingBluetooth = null;
+        getPreferences(MODE_PRIVATE).edit().putBoolean(USE_BLUETOOTH, false).apply();
+        resetConnection();
+    }
+    private void resetConnection() {
+        stopBluetooth();
+        stopStream();
+        page = 0;
+        if (desktop != null) { closeDesktop(); makeLayout(); }
+        else drawNav();
+        attemptedDesktop = null;
+        desktopFailed = false;
+        summarySelected = false;
+        snapshot = null;
+        sampledAt = 0;
+        displayKey = "";
+        loadPairing();
+        if (active && usesBluetooth()) startBluetooth();
+        connect();
+    }
+    private void showConnectionMessage(String message) {
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+    }
+    private void usePairing(String code, String origin) {
+        if (paired != null && pairedOrigin.equals(origin) && paired.matchesPairing(code)) return;
+        pairedOrigin = origin;
+        try {
+            paired = new BridgeClient(code, origin);
+        } catch (Exception ignored) {
+            paired = null;
+        }
     }
     @Override protected void onSaveInstanceState(Bundle state) {
         super.onSaveInstanceState(state); state.putInt("page", page); state.putInt("scroll", scroll == null ? scrollY : scroll.getScrollY()); state.putBoolean("summary", summarySelected);
+        state.putBoolean("scanAfterBluetoothReady", scanAfterBluetoothReady);
     }
-    @Override protected void onStart() { super.onStart(); active = true; loadPairing(); connect(); }
+    @Override protected void onStart() {
+        super.onStart();
+        active = true;
+        if (desktopFailed) attemptedDesktop = null;
+        loadPairing();
+        if (usesBluetooth()) startBluetooth();
+        connect();
+    }
     @Override protected void onResume() { super.onResume(); resumed = true; if (desktop != null) desktop.view.onResume(); }
     @Override protected void onPause() { resumed = false; if (desktop != null) desktop.view.onPause(); if (activeDialog != null) activeDialog.dismiss(); super.onPause(); }
     @Override protected void onStop() { active = false; stopStream(); live = false; super.onStop(); }
-    @Override protected void onDestroy() { closeDesktop(); super.onDestroy(); }
+    @Override protected void onDestroy() { closeDesktop(); clearBluetoothRecord(); stopBluetooth(); super.onDestroy(); }
     @Override public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) applySystemBars(getWindow());
@@ -96,15 +403,25 @@ public final class MainActivity extends Activity {
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
         if (request == DesktopPage.PICK_FILES && desktop != null) desktop.filePickerResult(result, data);
-    }
-    @Override public void onBackPressed() {
-        if (desktop == null) { super.onBackPressed(); return; }
-        if (desktop.view.canGoBack()) desktop.view.goBack();
-        else showSummary(false);
+        if (request == SCAN_BLUETOOTH && result == RESULT_OK) {
+            BluetoothPairing scanned = BluetoothScanActivity.takeResult();
+            if (scanned == null) showConnectionMessage("请再扫描一次电脑端二维码");
+            else {
+                clearBluetoothRecord();
+                PairingStore.clearBluetooth(this);
+                pendingBluetooth = scanned;
+                getPreferences(MODE_PRIVATE).edit().putBoolean(USE_BLUETOOTH, true).apply();
+                resetConnection();
+            }
+        }
+        if (request == ENABLE_BLUETOOTH) {
+            if (result == RESULT_OK) continueBluetoothAction();
+            else showConnectionMessage("请开启手机蓝牙后再连接");
+        }
     }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent); setIntent(intent);
-        if ((getPackageName() + UsbPairingProvider.ACTION_USB_PAIR_UPDATED).equals(intent.getAction())) {
+        if ((getPackageName() + UsbPairingProvider.ACTION_USB_PAIR_UPDATED).equals(intent.getAction()) && !usesBluetooth()) {
             stopStream(); loadPairing();
             if (desktopFailed) attemptedDesktop = null;
             snapshot = null; sampledAt = 0; displayKey = ""; connect();
@@ -128,24 +445,48 @@ public final class MainActivity extends Activity {
     }
     private void connect() {
         stopStream(); live = false;
-        if (desktop != null && attemptedDesktop != paired) {
+        boolean bluetoothReady = !usesBluetooth() || bluetoothTunnel != null && bluetoothTunnel.isPaired();
+        if (desktop != null && (attemptedDesktop != paired || !bluetoothReady)) {
             closeDesktop(); makeLayout(); displayKey = "";
         }
-        if (active && hasDesktopPairing() && !summarySelected && attemptedDesktop != paired) openDesktop();
+        if (active && !usesBluetooth() && hasDesktopPairing() && !summarySelected && attemptedDesktop != paired) {
+            openDesktop();
+        }
         if (desktop != null) return;
-        status = paired == null ? "USB 未连接" : "正在连接电脑"; paint(true);
-        if (active && paired != null) { stream = new Stream(paired); stream.start(); }
+        status = bluetoothReady ? paired == null ? "请选择连接方式" : "正在同步电脑数据" : bluetoothStatus;
+        paint(true);
+        if (active && paired != null && bluetoothReady) { stream = new Stream(paired); stream.start(); }
     }
-    private boolean hasDesktopPairing() { return paired != null && UsbPairingProvider.USB_ORIGIN.equals(pairedOrigin); }
+    private boolean hasDesktopPairing() {
+        return paired != null && paired.desktopOrigin() != null
+                && (!usesBluetooth() || bluetoothTunnel != null && bluetoothTunnel.isPaired());
+    }
     private void openDesktop() {
         if (desktop != null || !hasDesktopPairing()) return;
         attemptedDesktop = paired; desktopFailed = false; summarySelected = false;
+        TextView loading = label("正在加载电脑界面…", 16, text, true);
+        loading.setGravity(Gravity.CENTER);
+        loading.setBackgroundColor(bg);
+        try {
+            desktop = new DesktopPage(this, paired, () -> loading.setVisibility(View.GONE), () -> showSummary(true));
+        } catch (RuntimeException error) {
+            Log.w("Magpie", "Could not initialize WebView", error);
+            desktopFailed = true;
+            displayKey = "";
+            paint(true);
+            return;
+        }
         stopStream();
-        desktop = new DesktopPage(this, paired, () -> showSummary(true));
+        // Loading the remote page must never raise the IME before the user taps
+        // an actual form control. The page can still request the keyboard after
+        // an explicit tap because the window remains resizeable.
+        getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
+                | WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         FrameLayout frame = new FrameLayout(this);
         frame.setBackgroundColor(bg);
         fitSystemBars(frame);
         frame.addView(desktop.view, new FrameLayout.LayoutParams(-1, -1));
+        frame.addView(loading, new FrameLayout.LayoutParams(-1, -1));
         desktopSettings = button("手机", false, this::displayDialog);
         desktopSettings.setContentDescription("手机设置");
         desktopSettings.setMinHeight(dp(44));
@@ -200,7 +541,7 @@ public final class MainActivity extends Activity {
                 } catch (Exception error) {
                     if (closed) return;
                     if (BridgeClient.badPairing(error) || error instanceof BridgeClient.VersionException) {
-                        final String why = error instanceof BridgeClient.VersionException ? "版本不兼容，请检查电脑端同步桥" : "电脑配对已失效，请重新通过 USB 连接";
+                        final String why = error instanceof BridgeClient.VersionException ? "版本不兼容，请检查电脑端同步桥" : "电脑配对已失效，请重新配对";
                         ui.post(() -> { if (stream == this) updateLink(false, why); }); return;
                     }
                 } finally { HttpsURLConnection c = link; link = null; if (c != null) c.disconnect(); }
@@ -211,7 +552,10 @@ public final class MainActivity extends Activity {
             }
         }
     }
-    private String transportName() { return pairedOrigin.contains("127.0.0.1") || pairedOrigin.contains("localhost") ? "USB" : "局域网"; }
+    private String transportName() {
+        if (usesBluetooth()) return "蓝牙";
+        return UsbPairingProvider.USB_ORIGIN.equals(pairedOrigin) ? "USB" : "局域网";
+    }
     private void updateLink(boolean connected, String label) { if (live != connected || !status.equals(label)) displayKey = ""; live = connected; status = label; paint(true); }
     private int dp(float n) { return Math.round(n * getResources().getDisplayMetrics().density); }
     private static int rgb(String hex) { return Color.parseColor(hex); }
@@ -273,7 +617,7 @@ public final class MainActivity extends Activity {
         wide = getResources().getConfiguration().screenWidthDp >= 680; root = column(); root.setBackgroundColor(bg);
         fitSystemBars(root);
         LinearLayout top = row(); padding(top, 14, 4); top.addView(label("magpie", 20, text, true), new LinearLayout.LayoutParams(0, -2, 1));
-        connection = button(live ? transportName() + " 已连接" : "USB 未连接", false, this::pairDialog); connection.setMaxLines(2); top.addView(connection, lp(-2, -2)); root.addView(top, lp(-1, -2)); divider(root);
+        connection = button(live ? transportName() + " 已连接" : "连接方式", false, this::connectionDialog); connection.setMaxLines(2); top.addView(connection, lp(-2, -2)); root.addView(top, lp(-1, -2)); divider(root);
         LinearLayout middle = wide ? row() : column(); if (wide) middle.setGravity(Gravity.TOP); root.addView(middle, new LinearLayout.LayoutParams(-1, 0, 1));
         nav = wide ? column() : row(); padding(nav, 7, 4); nav.setBackgroundColor(surface);
         if (wide) { middle.addView(nav, lp(dp(166), -1)); View line = new View(this); line.setBackgroundColor(border); middle.addView(line, lp(dp(1), -1)); }
@@ -306,9 +650,19 @@ public final class MainActivity extends Activity {
         String key = page + "|" + status + "|" + commandPending + "|" + orientation() + "|" + (snapshot == null ? "" : snapshot.toString()); if (key.equals(displayKey)) return; displayKey = key;
         int position = preserve ? scroll.getScrollY() : scrollY; scrollY = 0; content.removeAllViews(); content.addView(label(PAGES[page], 26, text, true)); gap(content, 7);
         String last = status; if (!live && sampledAt != 0) last += " · 最后收到 " + DateFormat.getTimeInstance(DateFormat.MEDIUM).format(new Date(sampledAt)); note(last);
-        if (desktopFailed && hasDesktopPairing()) note("电脑界面暂不可用。确认 Mac 上的 Magpie 和 USB 服务正在运行后重试。");
-        if (snapshot == null && page != 3) { note("使用 USB 连接电脑。局域网需在设置中配对。USB 调试已授权后会自动识别。"); content.addView(button("USB 自动连接", true, this::pairDialog), lp(-1, -2)); }
-        else if (page == 0) drawAgents(); else if (page == 1) drawGateway(); else if (page == 2) drawRoutes(); else drawSettings();
+        if (hasDesktopPairing() && (usesBluetooth() || desktopFailed || page == 3)) {
+            if (desktopFailed) note("电脑界面暂不可用。确认电脑上的 Magpie 和连接服务正在运行后重试。");
+            content.addView(button(desktopFailed ? "重试电脑界面" : "打开完整电脑界面", true, this::openDesktop), lp(-1, -2));
+            gap(content, 12);
+        }
+        if (snapshot == null && page != 3) {
+            if (!hasDesktopPairing()) {
+                note("在电脑打开配置程序，再扫描蓝牙配对二维码。");
+                content.addView(button("扫描蓝牙二维码", true, () -> prepareBluetooth(true)), lp(-1, -2));
+                gap(content, 8);
+                content.addView(button("连接方式", false, this::connectionDialog), lp(-1, -2));
+            }
+        } else if (page == 0) drawAgents(); else if (page == 1) drawGateway(); else if (page == 2) drawRoutes(); else drawSettings();
         scroll.post(() -> scroll.scrollTo(0, position));
     }
     private void drawAgents() {
@@ -326,12 +680,14 @@ public final class MainActivity extends Activity {
             entry(card, item.optString("model"), "inFlight".equals(result) ? "进行中" : "success".equals(result) ? "成功" : "error".equals(result) ? "失败" : "未知", "success".equals(result) ? green : muted); }
     }
     private void drawSettings() {
-        if (hasDesktopPairing()) {
-            content.addView(button("打开电脑界面", true, this::openDesktop), lp(-1, -2)); gap(content, 12);
-        }
         JSONObject settings = section("settings"); LinearLayout card = panel(); int index = currencyIndex(settings.optString("currency")); entry(card, "电脑用量货币", index >= 0 ? CURRENCY_NAMES[index] : "未报告", text);
         if (canWrite()) card.addView(button("更改电脑用量货币", true, this::currencyDialog), lp(-1, -2)); else note(commandPending ? "正在等待电脑确认。" : "要更改货币，请在电脑端以允许写入模式启动同步桥。");
-        LinearLayout device = panel(); device.addView(button("屏幕与系统栏", false, this::displayDialog), lp(-1, -2)); divider(device); device.addView(button(paired == null ? "USB 未连接" : "管理局域网配对", false, this::pairDialog), lp(-1, -2));
+        LinearLayout device = panel();
+        device.addView(button("扫描蓝牙二维码", true, () -> prepareBluetooth(true)), lp(-1, -2));
+        divider(device);
+        device.addView(button("连接方式", false, this::connectionDialog), lp(-1, -2));
+        divider(device);
+        device.addView(button("屏幕与系统栏", false, this::displayDialog), lp(-1, -2));
     }
     private void displayDialog() {
         LinearLayout options = column();
@@ -342,6 +698,10 @@ public final class MainActivity extends Activity {
         }), lp(-1, -2));
         addBarOption(options, "显示状态栏", "showStatusBar");
         addBarOption(options, "显示系统导航栏", "showNavigationBar");
+        options.addView(button("扫描蓝牙二维码", false, () -> {
+            activeDialog.dismiss();
+            prepareBluetooth(true);
+        }), lp(-1, -2));
         AlertDialog.Builder dialog = new AlertDialog.Builder(this).setTitle("手机设置")
                 .setView(options).setPositiveButton("完成", null);
         if (desktop != null) dialog.setNeutralButton("连接与摘要", (d, w) -> showSummary(false));
@@ -363,25 +723,69 @@ public final class MainActivity extends Activity {
         options.addView(toggle, lp(-1, -2));
     }
     private void orientationDialog() {
-        activeDialog = new AlertDialog.Builder(this).setTitle("屏幕方向").setSingleChoiceItems(ORIENTATIONS, orientation(), (dialog, which) -> { getPreferences(MODE_PRIVATE).edit().putInt("orientation", which).apply(); dialog.dismiss(); applyOrientation(); if (desktop == null) paint(true); })
-                .setNegativeButton("取消", null).create(); activeDialog.setOnDismissListener(dialog -> activeDialog = null); activeDialog.show();
+        activeDialog = new AlertDialog.Builder(this).setTitle("屏幕方向")
+                .setSingleChoiceItems(ORIENTATIONS, orientation(), (dialog, which) -> {
+                    getPreferences(MODE_PRIVATE).edit().putInt("orientation", which).apply();
+                    applyOrientation();
+                    if (desktop == null) paint(true);
+                })
+                .setPositiveButton("完成", null)
+                .setNegativeButton("取消", null).create();
+        activeDialog.setOnDismissListener(dialog -> activeDialog = null);
+        activeDialog.show();
+        if (activeDialog.getWindow() != null) applySystemBars(activeDialog.getWindow());
+    }
+    private void connectionDialog() {
+        List<String> labels = new ArrayList<>();
+        List<Runnable> actions = new ArrayList<>();
+        boolean hasSavedBluetooth = PairingStore.loadBluetooth(this) != null;
+        labels.add("扫描蓝牙二维码");
+        actions.add(() -> prepareBluetooth(true));
+        if (hasSavedBluetooth) {
+            labels.add("重连已配对电脑");
+            actions.add(() -> prepareBluetooth(false));
+        }
+        labels.add("使用 USB / 已保存的局域网连接");
+        actions.add(this::useUsbOrLan);
+        labels.add("管理局域网配对");
+        actions.add(this::pairDialog);
+        if (usesBluetooth() || hasSavedBluetooth) {
+            labels.add("忘记蓝牙配对");
+            actions.add(() -> {
+                PairingStore.clearBluetooth(this);
+                useUsbOrLan();
+            });
+        }
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("连接方式")
+                .setItems(labels.toArray(new String[0]), (selected, which) -> {
+                    if (activeDialog == selected) activeDialog = null;
+                    actions.get(which).run();
+                })
+                .setNegativeButton("关闭", null).create();
+        activeDialog = dialog;
+        dialog.setOnDismissListener(d -> { if (activeDialog == d) activeDialog = null; });
+        dialog.show();
     }
     private void pairDialog() {
         EditText address = new EditText(this); address.setHint("USB 自动识别 · 局域网: https://192.168.x.x:43425"); address.setSingleLine(true);
-        address.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS); address.setText(pairedOrigin); address.setSaveEnabled(false); address.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+        PairingStore.Pairing nativePair = PairingStore.load(this);
+        boolean lanPaired = nativePair != null && !UsbPairingProvider.USB_ORIGIN.equals(nativePair.origin);
+        address.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        if (lanPaired) address.setText(nativePair.origin);
+        address.setSaveEnabled(false); address.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
         EditText input = new EditText(this); input.setHint("局域网电脑配对码（USB 无需输入）"); input.setSingleLine(true); input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         input.setSaveEnabled(false); input.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO); LinearLayout holder = column(); padding(holder, 20, 6); holder.addView(address, lp(-1, -2)); holder.addView(input, lp(-1, -2));
         holder.setFocusableInTouchMode(true);
         holder.requestFocus();
         AlertDialog.Builder builder = new AlertDialog.Builder(this).setTitle("局域网配对").setMessage("USB 在 Mac 上授权后自动连接，无需手工配对。此处仅用于电脑不在同一 USB 环境时的私有局域网配对。")
                 .setView(holder).setPositiveButton("配对局域网电脑", null).setNegativeButton("关闭", null);
-        if (paired != null && !pairedOrigin.contains("127.0.0.1")) builder.setNeutralButton("解除配对", (d, w) -> { PairingStore.clear(this); paired = null; pairedOrigin = "https://127.0.0.1:43425"; snapshot = null; sampledAt = 0; displayKey = ""; connect(); });
+        if (lanPaired) builder.setNeutralButton("解除配对", (d, w) -> { PairingStore.clear(this); if (!usesBluetooth()) resetConnection(); });
         activeDialog = builder.create(); activeDialog.setOnDismissListener(d -> activeDialog = null); activeDialog.show();
         if (activeDialog.getWindow() != null) {
             activeDialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
                     | WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         }
-        activeDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> { try { String origin = address.getText().toString().trim(), code = input.getText().toString().trim(); new BridgeClient(code, origin); PairingStore.save(this, code, origin); input.getText().clear(); activeDialog.dismiss(); paired = new BridgeClient(code, origin); pairedOrigin = origin; snapshot = null; sampledAt = 0; displayKey = ""; connect(); }
+        activeDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> { try { String origin = address.getText().toString().trim(), code = input.getText().toString().trim(); new BridgeClient(code, origin); PairingStore.save(this, code, origin); input.getText().clear(); activeDialog.dismiss(); useUsbOrLan(); }
             catch (IllegalArgumentException e) { input.setError("地址或配对码不正确。请使用 HTTPS 和可信私网地址。"); } catch (Exception e) { input.setError("无法安全保存配对。请检查设备安全芯片并重试。"); } });
     }
     private int currencyIndex(String value) { for (int i = 0; i < CURRENCIES.length; i++) if (CURRENCIES[i].equals(value)) return i; return -1; }

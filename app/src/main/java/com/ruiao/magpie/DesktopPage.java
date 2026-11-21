@@ -21,26 +21,34 @@ import android.webkit.WebViewClient;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.security.cert.CertificateFactory;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
+import java.util.regex.Pattern;
 
-/** Shows the connected Mac's own Magpie browser UI over the authorized USB tunnel. */
+/** Shows the connected computer's Magpie browser UI over its authenticated tunnel. */
 final class DesktopPage {
     static final int PICK_FILES = 515;
-    private static final String ORIGIN = BridgeClient.DESKTOP_ORIGIN;
+    private static final Pattern STATIC_PATH = Pattern.compile("/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_.-]+\\.(?:m?js|css)");
+    private static final Pattern ASSET_VERSION = Pattern.compile("v=[0-9a-f]{12}");
     private final Activity activity;
     private final BridgeClient bridge;
+    private final String origin;
+    private final int port;
     private final Runnable unavailable;
     final WebView view;
     private ValueCallback<Uri[]> filePicker;
-    private boolean closed;
+    private boolean closed, rendererGone;
 
-    DesktopPage(Activity activity, BridgeClient bridge, Runnable unavailable) {
+    DesktopPage(Activity activity, BridgeClient bridge, Runnable loaded, Runnable unavailable) {
         this.activity = activity;
         this.bridge = bridge;
+        this.origin = bridge.desktopOrigin();
+        this.port = Uri.parse(origin).getPort();
         this.unavailable = unavailable;
         view = new WebView(activity);
         view.clearSslPreferences();
@@ -52,15 +60,20 @@ final class DesktopPage {
         settings.setAllowContentAccess(false);
         settings.setJavaScriptCanOpenWindowsAutomatically(false);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
-        settings.setCacheMode(WebSettings.LOAD_NO_CACHE);
+        settings.setCacheMode(bridge.isBluetooth() ? WebSettings.LOAD_DEFAULT : WebSettings.LOAD_NO_CACHE);
         CookieManager.getInstance().setAcceptThirdPartyCookies(view, false);
+        // Keep the initial page load from stealing focus and opening the IME.
+        // Web form controls still receive focus and show the keyboard normally
+        // after an explicit user tap.
+        view.setFocusableInTouchMode(true);
+        view.requestFocus(android.view.View.FOCUS_DOWN);
         view.setWebViewClient(new WebViewClient() {
             @Override public boolean shouldOverrideUrlLoading(WebView current, WebResourceRequest request) {
                 return !sameOrigin(request.getUrl());
             }
 
             @Override public WebResourceResponse shouldInterceptRequest(WebView current, WebResourceRequest request) {
-                if (sameOrigin(request.getUrl())) return null;
+                if (sameOrigin(request.getUrl())) return cachedAsset(request);
                 return new WebResourceResponse("text/plain", "UTF-8", new ByteArrayInputStream(new byte[0]));
             }
 
@@ -74,14 +87,19 @@ final class DesktopPage {
             }
 
             @Override public void onReceivedError(WebView current, WebResourceRequest request, WebResourceError error) {
-                if (!closed && request.isForMainFrame()) unavailable.run();
+                if (!closed && requiredForPage(request)) unavailable.run();
             }
 
             @Override public void onReceivedHttpError(WebView current, WebResourceRequest request, WebResourceResponse response) {
-                if (!closed && request.isForMainFrame() && response.getStatusCode() >= 400) unavailable.run();
+                if (!closed && response.getStatusCode() >= 400 && requiredForPage(request)) unavailable.run();
+            }
+
+            @Override public void onPageFinished(WebView current, String url) {
+                if (!closed && url != null && sameOrigin(Uri.parse(url))) loaded.run();
             }
 
             @Override public boolean onRenderProcessGone(WebView current, android.webkit.RenderProcessGoneDetail detail) {
+                rendererGone = true;
                 if (!closed) unavailable.run();
                 return true;
             }
@@ -107,9 +125,9 @@ final class DesktopPage {
                 String sessionCookie = bridge.desktopCookie();
                 activity.runOnUiThread(() -> {
                     if (closed) return;
-                    CookieManager.getInstance().setCookie(ORIGIN, sessionCookie, stored -> {
+                    CookieManager.getInstance().setCookie(origin, sessionCookie, stored -> {
                         if (closed) return;
-                        if (Boolean.TRUE.equals(stored)) view.loadUrl(ORIGIN + "/?companion=android");
+                        if (Boolean.TRUE.equals(stored)) view.loadUrl(origin + "/?companion=android");
                         else unavailable.run();
                     });
                 });
@@ -141,11 +159,37 @@ final class DesktopPage {
     void close() {
         closed = true;
         finishFilePicker(null);
-        view.stopLoading();
+        if (!rendererGone) view.stopLoading();
         if (view.getParent() instanceof android.view.ViewGroup) {
             ((android.view.ViewGroup) view.getParent()).removeView(view);
         }
         view.destroy();
+    }
+
+    private boolean requiredForPage(WebResourceRequest request) {
+        Uri url = request.getUrl();
+        if (!sameOrigin(url)) return false;
+        String path = url.getPath();
+        return request.isForMainFrame() || "/app.js".equals(path) || "/app.css".equals(path)
+                || "/i18n.js".equals(path) || "/start.js".equals(path);
+    }
+
+    private WebResourceResponse cachedAsset(WebResourceRequest request) {
+        if (!bridge.isBluetooth() || request.isForMainFrame() || !"GET".equals(request.getMethod())) return null;
+        Uri url = request.getUrl();
+        String path = url.getEncodedPath();
+        String query = url.getEncodedQuery();
+        if (path == null || query == null || !STATIC_PATH.matcher(path).matches()
+                || !ASSET_VERSION.matcher(query).matches()) return null;
+        try {
+            // Upstream's version query is the SHA-256 prefix of the immutable asset.
+            InputStream body = activity.getAssets().open("magpie-web/" + query.substring(2) + path);
+            String mime = path.endsWith(".css") ? "text/css" : "text/javascript";
+            return new WebResourceResponse(mime, "UTF-8", 200, "OK",
+                    Collections.singletonMap("Cache-Control", "private, max-age=31536000, immutable"), body);
+        } catch (IOException missing) {
+            return null;
+        }
     }
 
     private boolean checkCertificate(SslCertificate sslCertificate) {
@@ -174,8 +218,8 @@ final class DesktopPage {
         return false;
     }
 
-    private static boolean sameOrigin(Uri uri) {
+    private boolean sameOrigin(Uri uri) {
         return "https".equals(uri.getScheme()) && "127.0.0.1".equals(uri.getHost())
-                && uri.getPort() == 43427 && uri.getUserInfo() == null;
+                && uri.getPort() == port && uri.getUserInfo() == null;
     }
 }

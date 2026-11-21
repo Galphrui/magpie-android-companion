@@ -65,6 +65,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("X-Magpie-Same", "fixture-revision")
         self.send_header("Set-Cookie", "desktop=" + KEY)
+        if self.path == "/app.js?v=123456789abc":
+            self.send_header("Cache-Control", "max-age=31536000, immutable")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(payload)
@@ -191,6 +193,15 @@ class BrowserBridgeTests(unittest.TestCase):
         status, _, _ = self.request(PLUGIN_ASSET, method="POST", body=b"{}", headers={"Origin": "null"})
         self.assertGreaterEqual(status, 400)
         self.assertEqual(len(self.upstream.requests), 1)
+
+    def test_bluetooth_cache_requires_upstream_version_match(self):
+        # The BLE server uses the phone's stable loopback origin across desktop sessions.
+        self.browser.cache_assets = True
+        session = self.sign_in()
+        _, matched, _ = self.request("/app.js?v=123456789abc", headers=session)
+        _, mismatched, _ = self.request("/app.js?v=000000000000", headers=session)
+        self.assertIn("immutable", matched["Cache-Control"])
+        self.assertEqual(mismatched["Cache-Control"], "no-store")
 
     def test_stream_frames_arrive_before_upstream_closes(self):
         session = self.sign_in()

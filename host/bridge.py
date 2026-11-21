@@ -2,7 +2,9 @@
 """Magpie's allowlisted, laptop-side HTTPS companion service (protocol v1)."""
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import getpass
+import gzip
 import hashlib
 import hmac
 import http.client
@@ -316,6 +318,13 @@ class Magpie:
         return result
 
     def _cli_get(self):
+        if os.name == "nt":
+            result = subprocess.run([self.cli, "settings", "get", "currency", "--json"],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, timeout=CLI_TIMEOUT, check=True)
+            if len(result.stdout) > 128:
+                raise Unavailable()
+            return decode_json(result.stdout)
         # Stream into a capped buffer rather than capturing unlimited subprocess output.
         with subprocess.Popen([self.cli, "settings", "get", "currency", "--json"],
                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -524,7 +533,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
                         pass
                     finally:
-                        self.connection.settimeout(CLIENT_TIMEOUT)
+                        self.connection.settimeout(self.server.client_timeout)
                 now = time.monotonic()
                 if frame is not None or now - last_sent >= self.server.heartbeat:
                     self.wfile.write(frame if frame is not None else b": heartbeat\n\n")
@@ -584,9 +593,10 @@ class BridgeServer(ThreadingHTTPServer):
     request_queue_size = MAX_CLIENTS
 
     def __init__(self, port, tls, token, adapter, *, interval=POLL, heartbeat=HEARTBEAT,
-                 bind=HOST, primary=None, handler=BridgeHandler):
+                 bind=HOST, primary=None, handler=BridgeHandler, client_timeout=CLIENT_TIMEOUT):
         super().__init__((bind, port), handler)
         self.tls, self.bearer, self.heartbeat = tls, "Bearer " + token, heartbeat
+        self.client_timeout = client_timeout
         self.owns_snapshots = primary is None
         self.slots = threading.BoundedSemaphore(MAX_CLIENTS) if primary is None else primary.slots
         self.snapshots = Snapshots(adapter, interval) if primary is None else primary.snapshots
@@ -605,9 +615,9 @@ class BridgeServer(ThreadingHTTPServer):
         tls_sock = None
         timer = None
         try:
-            request.settimeout(CLIENT_TIMEOUT)
+            request.settimeout(self.client_timeout)
             tls_sock = self.tls.wrap_socket(request, server_side=True, do_handshake_on_connect=False)
-            timer = deadline(CLIENT_TIMEOUT, tls_sock)
+            timer = deadline(self.client_timeout, tls_sock)
             tls_sock.do_handshake()
             # Pass the input deadline to the handler without global/per-peer mutable state.
             tls_sock.request_deadline = timer
@@ -761,11 +771,19 @@ class BrowserHandler(BridgeHandler):
                     style = f'<link rel="stylesheet" href="{ANDROID_STYLE}">'.encode()
                     patched = re.sub(rb"<head(?:\s[^>]*)?>", lambda match: match[0] + script, page, count=1, flags=re.I)
                     patched = re.sub(rb"</head\s*>", lambda match: style + match[0], patched, count=1, flags=re.I)
-                self._relay_response(response, patched)
+                immutable = (self.server.cache_assets and static and path != "/" and response.status == 200
+                             and re.fullmatch(r"[0-9a-f]{12}", query.get("v", [""])[0]) is not None
+                             and "immutable" in response.headers.get("Cache-Control", "").lower())
+                if (patched is not None and self.server.cache_assets
+                        and "gzip" in self.headers.get("Accept-Encoding", "")):
+                    patched = gzip.compress(patched, compresslevel=4)
+                    self._relay_response(response, patched, immutable, "gzip")
+                else:
+                    self._relay_response(response, patched, immutable)
             finally:
                 upstream.close()
 
-    def _relay_response(self, response, patched=None):
+    def _relay_response(self, response, patched=None, immutable=False, encoding=None):
         self.send_response(response.status)
         connection_options = {
             option.strip().lower()
@@ -776,7 +794,7 @@ class BrowserHandler(BridgeHandler):
             key = name.lower()
             if key in self.blocked_response_headers or key in connection_options or key.startswith("access-control-"):
                 continue
-            if patched is not None and key in ("content-length", "etag", "last-modified", "accept-ranges"):
+            if patched is not None and key in ("content-length", "content-encoding", "etag", "last-modified", "accept-ranges"):
                 continue
             if key == "location":
                 location = urlsplit(value)
@@ -788,8 +806,10 @@ class BrowserHandler(BridgeHandler):
                 self.send_header(name, value)
         if patched is not None:
             self.send_header("Content-Length", str(len(patched)))
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
         self.send_header("Connection", "close")
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "private, max-age=31536000, immutable" if immutable else "no-store")
         self.end_headers()
         if patched is not None:
             self.wfile.write(patched)
@@ -801,11 +821,12 @@ class BrowserHandler(BridgeHandler):
 
 
 class BrowserServer(BridgeServer):
-    def __init__(self, port, tls, token, adapter):
-        super().__init__(port, tls, token, adapter, handler=BrowserHandler)
+    def __init__(self, port, tls, token, adapter, *, client_port=None, client_timeout=CLIENT_TIMEOUT):
+        super().__init__(port, tls, token, adapter, handler=BrowserHandler, client_timeout=client_timeout)
         self.adapter = adapter
+        self.cache_assets = client_port is not None
         self.browser_token = secrets.token_urlsafe(32)
-        self.client_host = f"{HOST}:{self.server_port}"
+        self.client_host = f"{HOST}:{client_port if client_port is not None else self.server_port}"
         self.origin = f"https://{self.client_host}"
 
     def launch(self):
@@ -813,8 +834,37 @@ class BrowserServer(BridgeServer):
         return self
 
 
-def make_tls(folder, lan=None):
+def make_tls(folder, lan=None, *, portable=False):
     cert, key, config = (Path(folder) / name for name in ("cert.pem", "key.pem", "openssl.cnf"))
+    if portable or os.name == "nt":
+        # Windows has no inbox openssl CLI. An ECDSA leaf also keeps BLE handshakes small.
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+        private = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+        ips = [x509.IPAddress(ipaddress.ip_address(HOST)), x509.DNSName("localhost")]
+        if lan:
+            ips.append(x509.IPAddress(ipaddress.ip_address(lan)))
+        now = datetime.now(timezone.utc)
+        leaf = (x509.CertificateBuilder()
+                .subject_name(name).issuer_name(name).public_key(private.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(now - timedelta(minutes=5)).not_valid_after(now + timedelta(days=7))
+                .add_extension(x509.SubjectAlternativeName(ips), critical=False)
+                .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+                .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+                .sign(private, hashes.SHA256()))
+        cert.write_bytes(leaf.public_bytes(serialization.Encoding.PEM))
+        with open(key, "xb", opener=lambda path, flags: os.open(path, flags, 0o600)) as output:
+            output.write(private.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                               serialization.NoEncryption()))
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(cert, key)
+        return context, leaf.fingerprint(hashes.SHA256()).hex()
     sans = "IP:127.0.0.1,DNS:localhost" + (f",IP:{lan}" if lan else "")
     config.write_text("[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n"
                       f"[dn]\nCN=localhost\n[ext]\nsubjectAltName={sans}\n"
@@ -837,14 +887,19 @@ def browser_config_candidates():
     roots = []
     if os.environ.get("MAGPIE_CONFIG_DIR"):
         roots.append(Path(os.environ["MAGPIE_CONFIG_DIR"]))
+    if os.environ.get("XDG_CONFIG_HOME"):
+        xdg = Path(os.environ["XDG_CONFIG_HOME"])
+        if xdg.is_absolute():
+            roots.append(xdg / "magpie")
     roots.extend((home / ".config" / "magpie", home / "Library" / "Application Support" / "magpie"))
     return tuple(root / "web-page.json" for root in roots)
 
 
-def read_auto_key():
-    for path in browser_config_candidates():
+def read_auto_key(config_path=None):
+    for path in (Path(config_path),) if config_path else browser_config_candidates():
         try:
-            raw = path.read_bytes()
+            with path.open("rb") as source:
+                raw = source.read(4097)
             if len(raw) > 4096:
                 continue
             config = decode_json(raw)
@@ -882,7 +937,8 @@ def write_pairing_file(path, port, fingerprint, token):
                           "fingerprint": fingerprint, "pairing": f"{fingerprint}:{token}"})
     fd, tmp = tempfile.mkstemp(prefix=".magpie-usb-pairing-", dir=str(target.parent))
     try:
-        os.fchmod(fd, 0o600)
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "wb") as stream:
             stream.write(payload)
             stream.flush()

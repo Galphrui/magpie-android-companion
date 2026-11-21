@@ -16,7 +16,9 @@ independent of the browser's management operations.
 
 The original browser still has browser-versus-desktop restrictions. This
 transport does not handle external OAuth popups, gateway client endpoints,
-or third-party plugin private service routes. Full management is USB-only.
+or third-party plugin private service routes. Full management is also
+available over Bluetooth on macOS and Windows. See the project README for
+Bluetooth setup.
 
 Summary service
 ---------------

@@ -21,16 +21,15 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 final class BridgeClient {
-    static final String BASE = "https://127.0.0.1:43425/companion/v1/";
-    static final String DESKTOP_ORIGIN = "https://127.0.0.1:43427";
+    private static final String USB_BROWSER_ORIGIN = "https://127.0.0.1:43427";
     static final int MAX_LINE = 64 * 1024;
     private final String token;
     private final String fingerprint;
     private final byte[] fingerprintBytes;
     private final SSLContext tls;
     private final String base;
-
-    BridgeClient(String code) throws GeneralSecurityException { this(code, "https://127.0.0.1:43425"); }
+    private final String desktopOrigin;
+    private final boolean bluetooth;
 
     BridgeClient(String code, String origin) throws GeneralSecurityException {
         if (!code.matches("[a-fA-F0-9]{64}:[A-Za-z0-9_-]{43}")) {
@@ -42,6 +41,9 @@ final class BridgeClient {
             fingerprintBytes[i] = (byte) Integer.parseInt(fingerprint.substring(i * 2, i * 2 + 2), 16);
         }
         token = code.substring(65);
+        bluetooth = BluetoothPairing.ORIGIN.equals(origin);
+        desktopOrigin = bluetooth ? BluetoothPairing.BROWSER_ORIGIN
+                : UsbPairingProvider.USB_ORIGIN.equals(origin) ? USB_BROWSER_ORIGIN : null;
         try {
             URL endpoint = new URL(origin);
             String host = endpoint.getHost();
@@ -69,9 +71,9 @@ final class BridgeClient {
         }}, null);
     }
 
-    static BridgeClient parse(String code, String origin) throws GeneralSecurityException {
-        return new BridgeClient(code, origin);
-    }
+    String desktopOrigin() { return desktopOrigin; }
+
+    boolean isBluetooth() { return bluetooth; }
 
     boolean matchesPairing(String code) {
         return code.length() == 108 && fingerprint.equalsIgnoreCase(code.substring(0, 64))
@@ -89,7 +91,8 @@ final class BridgeClient {
     }
 
     String desktopCookie() throws IOException {
-        HttpsURLConnection connection = openUrl(DESKTOP_ORIGIN + "/companion-browser/session", "*/*");
+        if (desktopOrigin == null) throw new IOException("No compatible desktop origin");
+        HttpsURLConnection connection = openUrl(desktopOrigin + "/companion-browser/session", "*/*");
         try {
             int status = connection.getResponseCode();
             String cookie = connection.getHeaderField("Set-Cookie");
@@ -115,8 +118,8 @@ final class BridgeClient {
         // Leave HTTPS's default hostname verification enabled; the cert has a loopback IP SAN.
         connection.setInstanceFollowRedirects(false);
         connection.setUseCaches(false);
-        connection.setConnectTimeout(3500);
-        connection.setReadTimeout(15000);
+        connection.setConnectTimeout(bluetooth ? 12000 : 3500);
+        connection.setReadTimeout(bluetooth ? 90000 : 15000);
         connection.setRequestProperty("Authorization", "Bearer " + token);
         connection.setRequestProperty("Accept", accept);
         connection.setRequestProperty("Accept-Encoding", "identity");

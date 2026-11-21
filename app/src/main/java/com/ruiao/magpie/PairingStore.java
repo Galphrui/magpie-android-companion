@@ -6,7 +6,6 @@ import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
-import java.security.SecureRandom;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
@@ -17,13 +16,14 @@ import java.util.Base64;
 final class PairingStore {
     private static final String ALIAS = "magpie.companion.pairing.v1";
     private static final String PREFS = "companion_pairing";
+    private static final String BLUETOOTH = "bluetooth_pairing";
 
     static final class Pairing {
         final String code, origin;
         Pairing(String code, String origin) { this.code = code; this.origin = origin; }
     }
 
-    private static SecretKey key() throws Exception {
+    private static synchronized SecretKey key() throws Exception {
         KeyStore store = KeyStore.getInstance("AndroidKeyStore");
         store.load(null);
         if (store.containsAlias(ALIAS)) return (SecretKey) store.getKey(ALIAS, null);
@@ -89,17 +89,34 @@ final class PairingStore {
     }
 
     static void consumeUsb(Context context, String code) throws Exception {
-        save(context, code, "https://127.0.0.1:43425");
+        save(context, code, UsbPairingProvider.USB_ORIGIN);
     }
 
     static void clear(Context context) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().commit();
-        try {
-            KeyStore store = KeyStore.getInstance("AndroidKeyStore");
-            store.load(null);
-            if (store.containsAlias(ALIAS)) store.deleteEntry(ALIAS);
-        } catch (Exception ignored) { }
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove("pairing").remove("origin").commit();
     }
 
+    static BluetoothPairing loadBluetooth(Context context) {
+        SharedPreferences prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        String value = prefs.getString(BLUETOOTH, null);
+        if (value == null) return null;
+        try {
+            return BluetoothPairing.parse(new String(open(Base64.getDecoder().decode(value)), StandardCharsets.UTF_8));
+        } catch (Exception ignored) {
+            clearBluetooth(context);
+            return null;
+        }
+    }
+
+    static void saveBluetooth(Context context, BluetoothPairing pairing) throws Exception {
+        String encrypted = Base64.getEncoder().encodeToString(seal(pairing.encode().getBytes(StandardCharsets.UTF_8)));
+        if (!context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(BLUETOOTH, encrypted).commit()) {
+            throw new IllegalStateException("Could not securely save Bluetooth pairing");
+        }
+    }
+
+    static void clearBluetooth(Context context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(BLUETOOTH).commit();
+    }
     private PairingStore() { }
 }

@@ -64,7 +64,7 @@ final class BluetoothTunnel implements Closeable {
     private static final UUID SEND_UUID = UUID.fromString("3a53a032-1eef-4c97-8c9a-15ac27a9f2a2");
     private static final UUID CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
     private static final int HELLO = 1, PHONE_NONCE = 2, PHONE_PROOF = 3, HOST_PROOF = 4, READY = 5;
-    private static final int PING = 6, PONG = 7;
+    private static final int PING = 6, PONG = 7, LOG = 8;
     private static final int OPEN = 16, DATA = 17, FIN = 18, RESET = 19;
     private static final int HEADER_SIZE = 3, MIN_FRAME = 20, MAX_FRAME = 244;
     private static final int MAX_STREAMS = 12;
@@ -79,6 +79,7 @@ final class BluetoothTunnel implements Closeable {
     private final UUID serviceId;
     private final byte[] token;
     private final Consumer<String> status;
+    private final Consumer<String> log;
     private final Consumer<Boolean> connected;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final HandlerThread thread = new HandlerThread("Magpie BLE");
@@ -99,6 +100,7 @@ final class BluetoothTunnel implements Closeable {
     private ServerSocket summarySocket, browserSocket;
     private Frame sending;
     private byte[] hostNonce, phoneNonce;
+    private final StringBuilder logBuffer = new StringBuilder();
     private Runnable pairingTimeout;
     private boolean serviceAdded, advertising, subscribed, indications;
     private int lastStreamId, bindAttempts;
@@ -106,7 +108,8 @@ final class BluetoothTunnel implements Closeable {
     private volatile boolean paired, closed;
 
     static BluetoothTunnel start(Context context, UUID serviceId, String token,
-                                 Consumer<String> status, Consumer<Boolean> connected) throws IOException {
+                                 Consumer<String> status, Consumer<String> log,
+                                 Consumer<Boolean> connected) throws IOException {
         if (serviceId == null || token == null || !token.matches("[A-Za-z0-9_-]{43}")) {
             throw new IOException("蓝牙配对信息无效");
         }
@@ -117,20 +120,22 @@ final class BluetoothTunnel implements Closeable {
             if (!adapter.isEnabled()) throw new IOException("请先开启手机蓝牙");
             BluetoothLeAdvertiser advertiser = adapter.getBluetoothLeAdvertiser();
             if (advertiser == null) throw new IOException("此手机无法发布低功耗蓝牙服务");
-            return new BluetoothTunnel(context, manager, advertiser, serviceId, token, status, connected);
+            return new BluetoothTunnel(context, manager, advertiser, serviceId, token, status, log, connected);
         } catch (SecurityException error) {
             throw new IOException("请允许应用使用附近设备蓝牙权限", error);
         }
     }
 
     private BluetoothTunnel(Context context, BluetoothManager manager, BluetoothLeAdvertiser advertiser,
-                            UUID serviceId, String token, Consumer<String> status, Consumer<Boolean> connected) {
+                            UUID serviceId, String token, Consumer<String> status, Consumer<String> log,
+                            Consumer<Boolean> connected) {
         this.context = context.getApplicationContext();
         this.manager = manager;
         this.advertiser = advertiser;
         this.serviceId = serviceId;
         this.token = token.getBytes(StandardCharsets.US_ASCII);
         this.status = status;
+        this.log = log;
         this.connected = connected;
         thread.start();
         handler = new Handler(thread.getLooper());
@@ -160,9 +165,8 @@ final class BluetoothTunnel implements Closeable {
             BluetoothGattService service = new BluetoothGattService(serviceId, BluetoothGattService.SERVICE_TYPE_PRIMARY);
             service.addCharacteristic(new BluetoothGattCharacteristic(WRITE_UUID,
                     BluetoothGattCharacteristic.PROPERTY_WRITE, BluetoothGattCharacteristic.PERMISSION_WRITE));
-            int sendProperties = BluetoothGattCharacteristic.PROPERTY_INDICATE
-                    | (Build.VERSION.SDK_INT >= 33 ? BluetoothGattCharacteristic.PROPERTY_NOTIFY : 0);
-            sendCharacteristic = new BluetoothGattCharacteristic(SEND_UUID, sendProperties, 0);
+            sendCharacteristic = new BluetoothGattCharacteristic(SEND_UUID,
+                    BluetoothGattCharacteristic.PROPERTY_INDICATE | BluetoothGattCharacteristic.PROPERTY_NOTIFY, 0);
             sendCharacteristic.addDescriptor(new BluetoothGattDescriptor(CCCD,
                     BluetoothGattDescriptor.PERMISSION_READ | BluetoothGattDescriptor.PERMISSION_WRITE));
             service.addCharacteristic(sendCharacteristic);
@@ -307,8 +311,10 @@ final class BluetoothTunnel implements Closeable {
             byte[] frame = value == null ? EMPTY : value.clone();
             postSafely(() -> {
                 if (closed) return;
+                // Bulk DATA arrives as write-without-response; the pre-auth
+                // handshake must still use a confirmed write for reliability.
                 boolean valid = device.equals(peer) && WRITE_UUID.equals(characteristic.getUuid())
-                        && offset == 0 && responseNeeded && !preparedWrite && process(frame);
+                        && offset == 0 && !preparedWrite && (paired || responseNeeded) && process(frame);
                 if (responseNeeded) respond(device, requestId, valid, null);
                 if (!valid && device.equals(peer)) {
                     dropPeer("蓝牙验证或通信失败，请确认正在使用桌面端的二维码");
@@ -359,6 +365,10 @@ final class BluetoothTunnel implements Closeable {
         int length = frame.length - HEADER_SIZE;
         if (id == 0) {
             if (!paired) return authenticate(op, frame);
+            if (op == LOG) {
+                acceptLog(frame);
+                return true;
+            }
             if (op != PING || length != 0) return false;
             handler.removeCallbacks(heartbeatTimeout);
             handler.postDelayed(heartbeatTimeout, HEARTBEAT_TIMEOUT_MS);
@@ -379,6 +389,20 @@ final class BluetoothTunnel implements Closeable {
             stream.remoteFinished = true;
         }
         return true;
+    }
+
+    private void acceptLog(byte[] frame) {
+        String piece = new String(frame, HEADER_SIZE, frame.length - HEADER_SIZE, StandardCharsets.UTF_8);
+        if (piece.isEmpty()) {
+            if (logBuffer.length() > 0) {
+                final String line = logBuffer.toString();
+                logBuffer.setLength(0);
+                if (log != null) ui.post(() -> log.accept(line));
+            }
+            return;
+        }
+        logBuffer.append(piece);
+        if (logBuffer.length() > 4096) logBuffer.setLength(0);
     }
 
     private boolean authenticate(int op, byte[] frame) {
@@ -461,7 +485,9 @@ final class BluetoothTunnel implements Closeable {
                         == BluetoothStatusCodes.SUCCESS;
             } else {
                 sendCharacteristic.setValue(frame.bytes);
-                sent = gatt.notifyCharacteristicChanged(peer, sendCharacteristic, true);
+                // confirm=false uses a notification: no per-frame ATT handshake, so
+                // the controller can pipeline frames and reach far higher throughput.
+                sent = gatt.notifyCharacteristicChanged(peer, sendCharacteristic, indications);
             }
             if (!sent) {
                 dropPeer("蓝牙数据发送失败，正在等待重连");

@@ -28,6 +28,7 @@ import android.view.WindowManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
@@ -41,6 +42,7 @@ import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
 import java.io.IOException;
 import java.text.DateFormat;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
@@ -87,6 +89,8 @@ public final class MainActivity extends ComponentActivity {
     private Runnable bluetoothPairingExpiry, bluetoothRetryTask;
     private String bluetoothStatus = "蓝牙未连接";
     private boolean scanAfterBluetoothReady;
+    private final ArrayDeque<String> loadLog = new ArrayDeque<>();
+    private TextView loadingLog;
 
     @Override protected void onCreate(Bundle state) {
         boolean night = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
@@ -237,6 +241,10 @@ public final class MainActivity extends ComponentActivity {
                             updateLink(false, bluetoothStatus);
                         }
                     },
+                    line -> {
+                        if (generation != bluetoothGeneration) return;
+                        addLoadLog(line);
+                    },
                     connected -> onBluetoothState(generation, pairing, connected));
             tunnelPairing = pairing;
         } catch (IOException | SecurityException error) {
@@ -375,6 +383,17 @@ public final class MainActivity extends ComponentActivity {
     private void showConnectionMessage(String message) {
         Toast.makeText(this, message, Toast.LENGTH_LONG).show();
     }
+    private void addLoadLog(String line) {
+        if (line == null || line.isEmpty()) return;
+        String stamped = DateFormat.getTimeInstance(DateFormat.MEDIUM).format(new Date()) + " " + line;
+        loadLog.addLast(stamped);
+        while (loadLog.size() > 30) loadLog.removeFirst();
+        if (loadingLog != null && loadingLog.getParent() != null) {
+            StringBuilder joined = new StringBuilder();
+            for (String item : loadLog) joined.append(item).append('\n');
+            loadingLog.setText(joined.toString().trim());
+        }
+    }
     private void usePairing(String code, String origin) {
         if (paired != null && pairedOrigin.equals(origin) && paired.matchesPairing(code)) return;
         pairedOrigin = origin;
@@ -476,8 +495,25 @@ public final class MainActivity extends ComponentActivity {
     private void openDesktop() {
         if (desktop != null || !hasDesktopPairing()) return;
         attemptedDesktop = paired; desktopFailed = false; summarySelected = false;
-        TextView loading = label("正在加载电脑界面…", 16, text, true);
+        LinearLayout loading = new LinearLayout(this);
+        loading.setOrientation(LinearLayout.VERTICAL);
         loading.setGravity(Gravity.CENTER);
+        padding(loading, 22, 8);
+        TextView loadingTitle = label("正在加载电脑界面…", 16, text, true);
+        loadingTitle.setGravity(Gravity.CENTER);
+        loading.addView(loadingTitle, lp(-1, -2));
+        gap(loading, 10);
+        ProgressBar loadingBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        loadingBar.setIndeterminate(true);
+        loading.addView(loadingBar, lp(-1, dp(3)));
+        gap(loading, 10);
+        loadingLog = label("", 12, muted, false);
+        loadingLog.setTextIsSelectable(true);
+        loadingLog.setLineSpacing(dp(2), 1);
+        StringBuilder joined = new StringBuilder();
+        for (String item : loadLog) joined.append(item).append('\n');
+        loadingLog.setText(joined.toString().trim());
+        loading.addView(loadingLog, lp(-1, -2));
         loading.setBackgroundColor(bg);
         try {
             desktop = new DesktopPage(this, paired, () -> loading.setVisibility(View.GONE), () -> showSummary(true));
@@ -662,6 +698,22 @@ public final class MainActivity extends ComponentActivity {
         String key = page + "|" + status + "|" + commandPending + "|" + orientation() + "|" + (snapshot == null ? "" : snapshot.toString()); if (key.equals(displayKey)) return; displayKey = key;
         int position = preserve ? scroll.getScrollY() : scrollY; scrollY = 0; content.removeAllViews(); content.addView(label(PAGES[page], 26, text, true)); gap(content, 7);
         String last = status; if (!live && sampledAt != 0) last += " · 最后收到 " + DateFormat.getTimeInstance(DateFormat.MEDIUM).format(new Date(sampledAt)); note(last);
+        if (paired != null && !live) {
+            ProgressBar syncBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+            syncBar.setIndeterminate(true);
+            content.addView(syncBar, lp(-1, dp(3)));
+            gap(content, 7);
+            if (!loadLog.isEmpty()) {
+                StringBuilder joined = new StringBuilder();
+                int skip = Math.max(0, loadLog.size() - 8);
+                int index = 0;
+                for (String item : loadLog) {
+                    if (index++ < skip) continue;
+                    joined.append(item).append('\n');
+                }
+                note(joined.toString().trim());
+            }
+        }
         if (hasDesktopPairing() && (usesBluetooth() || desktopFailed || page == 3)) {
             if (desktopFailed) note("电脑界面暂不可用。确认电脑上的 Magpie 和连接服务正在运行后重试。");
             content.addView(button(desktopFailed ? "重试电脑界面" : "打开完整电脑界面", true, this::openDesktop), lp(-1, -2));

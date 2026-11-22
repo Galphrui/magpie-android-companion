@@ -8,6 +8,7 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import time
 
 from bridge import browser_config_candidates, decode_json, read_auto_key
 
@@ -136,7 +137,17 @@ class ConfigWindow:
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.bind("<Configure>", self.redraw)
         self.status = tk.StringVar(value="准备配对")
-        ttk.Label(frame, textvariable=self.status, wraplength=372).pack(anchor=tk.W, pady=(12, 0))
+        ttk.Label(frame, textvariable=self.status, wraplength=372).pack(anchor=tk.W, pady=(12, 4))
+        self.progress = ttk.Progressbar(frame, mode="indeterminate")
+        self.progress.pack(fill=tk.X, pady=(0, 6))
+        log_frame = ttk.LabelFrame(frame, text="加载日志")
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        self.log_text = tk.Text(log_frame, height=8, wrap="word", state="disabled",
+                                font=("TkDefaultFont", 10))
+        scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         window.protocol("WM_DELETE_WINDOW", self.close)
         window.after(80, self.poll)
@@ -150,6 +161,8 @@ class ConfigWindow:
         self.stop_event = threading.Event()
         self.failed = False
         self.status.set("正在检查 Magpie 和准备蓝牙配对…")
+        self._append_log(self.status.get())
+        self.progress.start(12)
         threading.Thread(target=run_worker, args=("", self.stop_event, self.events, generation),
                          name="magpie-bluetooth", daemon=True).start()
 
@@ -157,6 +170,8 @@ class ConfigWindow:
         if self.stop_event is not None:
             self.stop_event.set()
             self.status.set("正在停止蓝牙连接…")
+            self._append_log(self.status.get())
+            self.progress.stop()
             self.qr_matrix = None
             self.connected = False
             self.redraw()
@@ -198,12 +213,14 @@ class ConfigWindow:
                 self.stop_event = None
                 self.qr_matrix = None
                 self.connected = False
+                self.progress.stop()
                 if self.closing:
                     self.window.destroy()
                     return
                 self.redraw()
                 if not self.failed:
                     self.status.set("蓝牙监听已停止，正在重新启动…")
+                    self._append_log(self.status.get())
                 self.window.after(3000, self.start)
             elif self.stop_event is not None and not self.stop_event.is_set():
                 if event == "qr":
@@ -221,7 +238,23 @@ class ConfigWindow:
                         self.redraw()
                     self.failed = event == "error"
                     self.status.set(value)
+                    self._append_log(value)
+                    if self.connected or event == "error":
+                        self.progress.stop()
+                    else:
+                        self.progress.start(12)
         self.window.after(80, self.poll)
+
+    def _append_log(self, value):
+        if not value:
+            return
+        self.log_text.configure(state="normal")
+        self.log_text.insert(tk.END, time.strftime("%H:%M:%S") + "  " + value + "\n")
+        lines = int(self.log_text.index("end-1c").split(".")[0])
+        if lines > 240:
+            self.log_text.delete("1.0", f"{lines - 200}.0")
+        self.log_text.see(tk.END)
+        self.log_text.configure(state="disabled")
 
 
 def main():

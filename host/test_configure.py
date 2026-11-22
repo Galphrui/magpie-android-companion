@@ -33,6 +33,33 @@ class BluetoothConfigurationTests(unittest.TestCase):
             def bind(self, *_args):
                 pass
 
+            def configure(self, **_options):
+                pass
+
+            def insert(self, *_args):
+                pass
+
+            def index(self, _position):
+                return "2.0"
+
+            def delete(self, *_args):
+                pass
+
+            def see(self, _position):
+                pass
+
+            def yview(self, *_args):
+                pass
+
+            def set(self, *_args):
+                pass
+
+            def start(self, _interval=None):
+                pass
+
+            def stop(self):
+                pass
+
         class Root:
             def __init__(self):
                 self.callbacks = {}
@@ -65,13 +92,22 @@ class BluetoothConfigurationTests(unittest.TestCase):
         class Tk:
             BOTH = "both"
             W = "w"
+            X = "x"
+            END = "end"
+            Y = "y"
+            LEFT = "left"
+            RIGHT = "right"
             Canvas = lambda *_args, **options: Widget(**options)
+            Text = lambda *_args, **options: Widget(**options)
 
         Tk.StringVar = StringVar
 
         class Ttk:
             Frame = lambda *_args, **options: Widget(**options)
             Label = lambda *_args, **options: Widget(**options)
+            Progressbar = lambda *_args, **options: Widget(**options)
+            LabelFrame = lambda *_args, **options: Widget(**options)
+            Scrollbar = lambda *_args, **options: Widget(**options)
 
         class QRCode:
             pass

@@ -51,14 +51,54 @@ class Stream:
     task: asyncio.Task | None = None
     phone_finished: bool = False
     host_finished: bool = False
+    channel: int = 0
+
+
+class LoadProgress:
+    """Byte-level progress for the browser download stage, shared with the UI."""
+
+    def __init__(self, desktop=lambda text: None):
+        self.desktop = desktop
+        self.phone = None
+        self.expected = 0
+        self.delivered = 0
+        self._last = 0.0
+
+    def attach_phone(self, sender):
+        self.phone = sender
+
+    def add_expected(self, size):
+        self.expected += max(0, int(size))
+
+    def add_delivered(self, size):
+        self.delivered += max(0, int(size))
+        self._maybe_emit()
+
+    def _emit(self, text):
+        try:
+            self.desktop(text)
+        except Exception:
+            pass
+        if self.phone is not None:
+            self.phone(text)
+
+    def _maybe_emit(self):
+        now = time.monotonic()
+        if now - self._last < 0.5:
+            return
+        self._last = now
+        percent = min(100, int(100 * self.delivered / self.expected)) if self.expected else 0
+        self._emit(f"STAGE 界面 {percent}")
+        self._emit(f"界面加载 {percent}%（已下载 {self.delivered / 1024:.0f} KB / 共 {self.expected / 1024:.0f} KB）")
 
 
 class Relay:
     """One authenticated BLE connection and its bounded set of TCP streams."""
 
-    def __init__(self, client, token, ports, progress=None):
+    def __init__(self, client, token, ports, progress=None, load=None):
         self.client, self.token, self.ports = client, token, ports
         self.progress = progress
+        self.load = load
         self.frames = asyncio.Queue(256)
         self.send_lock = asyncio.Lock()
         self.pong = asyncio.Event()
@@ -164,6 +204,9 @@ class Relay:
                 raise LinkError("could not send BLE frame") from error
             if opcode == DATA:
                 self.bytes_to_phone += len(payload)
+                stream = self.streams.get(stream_id)
+                if self.load is not None and stream is not None and stream.channel == 2:
+                    self.load.add_delivered(len(payload))
                 self._account()
 
     async def receive(self):
@@ -186,6 +229,9 @@ class Relay:
         if await self.receive() != (READY, 0, b""):
             raise LinkError("phone did not complete verification")
         self.authenticated = True
+        if self.load is not None:
+            self.load.attach_phone(lambda text: asyncio.create_task(self._send_log(text)))
+        self._log("STAGE 配对 100")
         self._log("蓝牙配对完成，开始同步数据")
 
     def remove_stream(self, stream_id):
@@ -227,9 +273,15 @@ class Relay:
                 await self.send(RESET, stream_id)
                 return
             stream = Stream(writer)
+            stream.channel = payload[0]
             self.streams[stream_id] = stream
             stream.task = asyncio.create_task(self.pump(stream_id, stream, reader))
-            self._log("已建立" + ("摘要通道" if payload[0] == 1 else "浏览器通道"))
+            if payload[0] == 1:
+                self._log("STAGE 通道 50")
+                self._log("已建立摘要通道")
+            else:
+                self._log("STAGE 通道 100")
+                self._log("已建立浏览器通道")
         elif stream is not None:
             try:
                 if opcode == DATA and payload and not stream.phone_finished:
@@ -293,11 +345,12 @@ class DesktopSession:
             folder = self.stack.enter_context(tempfile.TemporaryDirectory(prefix="magpie-ble-"))
             tls, self.fingerprint = bridge.make_tls(folder, portable=True)
             adapter = bridge.Magpie(self.browser_port, self.gateway_port, self.browser_key, self.token)
+            self.load = LoadProgress(desktop=self.status)
             summary = self.stack.enter_context(
                 bridge.BridgeServer(0, tls, self.token, adapter, client_timeout=75))
             browser = self.stack.enter_context(
                 bridge.BrowserServer(0, tls, self.token, adapter, client_port=BROWSER_PORT,
-                                     cache_assets=True, client_timeout=75))
+                                     cache_assets=True, client_timeout=75, progress=self.load))
             for server in (summary, browser):
                 threading.Thread(target=server.serve_forever, name="magpie-ble-http", daemon=True).start()
                 self.stack.callback(server.shutdown)
@@ -407,10 +460,11 @@ class DesktopSession:
                     device = await self._find_phone(CONNECT_TIMEOUT)
                     if device is None:
                         raise
-            relay = Relay(client, self.token, self.ports, progress=self.status)
+            relay = Relay(client, self.token, self.ports, progress=self.status, load=self.load)
             heartbeat = None
             try:
                 self.status("正在验证手机")
+                self.status("STAGE 配对 50")
                 characteristic = client.services.get_characteristic(TX)
                 force_indicate = characteristic is None or "notify" not in characteristic.properties
                 await asyncio.wait_for(

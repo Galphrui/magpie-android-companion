@@ -784,6 +784,11 @@ class BrowserHandler(BridgeHandler):
                 upstream.close()
 
     def _relay_response(self, response, patched=None, immutable=False, encoding=None):
+        progress = getattr(self.server, "progress", None)
+        if progress is not None and self.command == "GET" and response.status == 200:
+            length = response.headers.get("Content-Length")
+            if length is not None and length.isdigit():
+                progress.add_expected(int(length))
         self.send_response(response.status)
         connection_options = {
             option.strip().lower()
@@ -822,10 +827,11 @@ class BrowserHandler(BridgeHandler):
 
 class BrowserServer(BridgeServer):
     def __init__(self, port, tls, token, adapter, *, client_port=None, cache_assets=False,
-                 client_timeout=CLIENT_TIMEOUT):
+                 client_timeout=CLIENT_TIMEOUT, progress=None):
         super().__init__(port, tls, token, adapter, handler=BrowserHandler, client_timeout=client_timeout)
         self.adapter = adapter
         self.cache_assets = bool(cache_assets)
+        self.progress = progress
         self.browser_token = secrets.token_urlsafe(32)
         self.client_host = f"{HOST}:{client_port if client_port is not None else self.server_port}"
         self.origin = f"https://{self.client_host}"

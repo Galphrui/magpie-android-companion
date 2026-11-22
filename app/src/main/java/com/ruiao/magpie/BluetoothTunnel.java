@@ -163,10 +163,15 @@ final class BluetoothTunnel implements Closeable {
                 return;
             }
             BluetoothGattService service = new BluetoothGattService(serviceId, BluetoothGattService.SERVICE_TYPE_PRIMARY);
+            // The host streams bulk responses with write-without-response, so the
+            // write characteristic must expose that property in addition to the
+            // confirmed write used by the pairing handshake.
             service.addCharacteristic(new BluetoothGattCharacteristic(WRITE_UUID,
-                    BluetoothGattCharacteristic.PROPERTY_WRITE, BluetoothGattCharacteristic.PERMISSION_WRITE));
-            sendCharacteristic = new BluetoothGattCharacteristic(SEND_UUID,
-                    BluetoothGattCharacteristic.PROPERTY_INDICATE | BluetoothGattCharacteristic.PROPERTY_NOTIFY, 0);
+                    BluetoothGattCharacteristic.PROPERTY_WRITE | BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
+                    BluetoothGattCharacteristic.PERMISSION_WRITE));
+            int sendProperties = BluetoothGattCharacteristic.PROPERTY_INDICATE
+                    | (Build.VERSION.SDK_INT >= 33 ? BluetoothGattCharacteristic.PROPERTY_NOTIFY : 0);
+            sendCharacteristic = new BluetoothGattCharacteristic(SEND_UUID, sendProperties, 0);
             sendCharacteristic.addDescriptor(new BluetoothGattDescriptor(CCCD,
                     BluetoothGattDescriptor.PERMISSION_READ | BluetoothGattDescriptor.PERMISSION_WRITE));
             service.addCharacteristic(sendCharacteristic);
@@ -485,9 +490,9 @@ final class BluetoothTunnel implements Closeable {
                         == BluetoothStatusCodes.SUCCESS;
             } else {
                 sendCharacteristic.setValue(frame.bytes);
-                // confirm=false uses a notification: no per-frame ATT handshake, so
-                // the controller can pipeline frames and reach far higher throughput.
-                sent = gatt.notifyCharacteristicChanged(peer, sendCharacteristic, indications);
+                // Pre-33 GATT servers do not reliably report onNotificationSent for
+                // notifications, so keep confirmed indications for phone→host frames.
+                sent = gatt.notifyCharacteristicChanged(peer, sendCharacteristic, true);
             }
             if (!sent) {
                 dropPeer("蓝牙数据发送失败，正在等待重连");

@@ -91,6 +91,12 @@ public final class MainActivity extends ComponentActivity {
     private boolean scanAfterBluetoothReady;
     private final ArrayDeque<String> loadLog = new ArrayDeque<>();
     private TextView loadingLog;
+    private ProgressBar loadingOverall, loadingStage;
+    private TextView loadingPercent, loadingStageLabel;
+    private final java.util.HashMap<String, Integer> stagePercent = new java.util.HashMap<>();
+    private boolean summaryStageLogged;
+    private static final String[] STAGE_NAMES = {"配对", "通道", "摘要", "界面"};
+    private static final int[] STAGE_WEIGHTS = {25, 10, 10, 55};
 
     @Override protected void onCreate(Bundle state) {
         boolean night = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
@@ -208,12 +214,14 @@ public final class MainActivity extends ComponentActivity {
             return;
         }
         bluetoothStatus = "正在启动蓝牙配对";
+        addLoadLog("STAGE 配对 0");
         int generation = bluetoothGeneration;
         try {
             bluetoothTunnel = BluetoothTunnel.start(this, pairing.serviceId, pairing.token(),
                     message -> {
                         if (generation != bluetoothGeneration) return;
                         bluetoothStatus = message;
+                        if ("蓝牙已配对".equals(message)) addLoadLog("STAGE 配对 100");
                         // A tunnel can fail before a peer connects, so no connection
                         // callback is emitted. Reclaim that closed instance and retry
                         // with the same QR instead of leaving the UI permanently stuck.
@@ -385,6 +393,15 @@ public final class MainActivity extends ComponentActivity {
     }
     private void addLoadLog(String line) {
         if (line == null || line.isEmpty()) return;
+        if (line.startsWith("STAGE ")) {
+            String[] parts = line.split(" ");
+            if (parts.length >= 3) {
+                try {
+                    stagePercent.put(parts[1], Math.max(0, Math.min(100, Integer.parseInt(parts[2]))));
+                } catch (NumberFormatException ignored) {
+                }
+            }
+        }
         String stamped = DateFormat.getTimeInstance(DateFormat.MEDIUM).format(new Date()) + " " + line;
         loadLog.addLast(stamped);
         while (loadLog.size() > 30) loadLog.removeFirst();
@@ -393,6 +410,36 @@ public final class MainActivity extends ComponentActivity {
             for (String item : loadLog) joined.append(item).append('\n');
             loadingLog.setText(joined.toString().trim());
         }
+        refreshLoadingOverlay();
+    }
+
+    private int overallPercent() {
+        int total = 0;
+        for (int i = 0; i < STAGE_NAMES.length; i++) {
+            Integer percent = stagePercent.get(STAGE_NAMES[i]);
+            total += STAGE_WEIGHTS[i] * (percent == null ? 0 : percent) / 100;
+        }
+        return Math.max(0, Math.min(100, total));
+    }
+
+    private String currentStageName() {
+        for (String name : STAGE_NAMES) {
+            Integer percent = stagePercent.get(name);
+            if (percent != null && percent < 100) return name;
+        }
+        return "界面";
+    }
+
+    private void refreshLoadingOverlay() {
+        if (loadingOverall == null || loadingOverall.getParent() == null) return;
+        int overall = overallPercent();
+        loadingOverall.setProgress(overall);
+        loadingPercent.setText(overall + "%");
+        String current = currentStageName();
+        Integer percent = stagePercent.get(current);
+        if (percent == null) percent = 0;
+        loadingStage.setProgress(percent);
+        loadingStageLabel.setText(current + " " + percent + "%");
     }
     private void usePairing(String code, String origin) {
         if (paired != null && pairedOrigin.equals(origin) && paired.matchesPairing(code)) return;
@@ -502,10 +549,24 @@ public final class MainActivity extends ComponentActivity {
         TextView loadingTitle = label("正在加载电脑界面…", 16, text, true);
         loadingTitle.setGravity(Gravity.CENTER);
         loading.addView(loadingTitle, lp(-1, -2));
+        gap(loading, 12);
+        loadingPercent = label("0%", 20, text, true);
+        loadingPercent.setGravity(Gravity.CENTER);
+        loading.addView(loadingPercent, lp(-1, -2));
+        gap(loading, 4);
+        loadingOverall = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        loadingOverall.setMax(100);
+        loadingOverall.setProgress(0);
+        loading.addView(loadingOverall, lp(-1, dp(4)));
         gap(loading, 10);
-        ProgressBar loadingBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        loadingBar.setIndeterminate(true);
-        loading.addView(loadingBar, lp(-1, dp(3)));
+        loadingStageLabel = label("配对 0%", 13, muted, false);
+        loadingStageLabel.setGravity(Gravity.CENTER);
+        loading.addView(loadingStageLabel, lp(-1, -2));
+        gap(loading, 4);
+        loadingStage = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        loadingStage.setMax(100);
+        loadingStage.setProgress(0);
+        loading.addView(loadingStage, lp(-1, dp(3)));
         gap(loading, 10);
         loadingLog = label("", 12, muted, false);
         loadingLog.setTextIsSelectable(true);
@@ -515,6 +576,7 @@ public final class MainActivity extends ComponentActivity {
         loadingLog.setText(joined.toString().trim());
         loading.addView(loadingLog, lp(-1, -2));
         loading.setBackgroundColor(bg);
+        refreshLoadingOverlay();
         try {
             desktop = new DesktopPage(this, paired, () -> loading.setVisibility(View.GONE), () -> showSummary(true));
         } catch (RuntimeException error) {
@@ -584,6 +646,11 @@ public final class MainActivity extends ComponentActivity {
                         if (stream != this || !active) return;
                         displayKey = ""; snapshot = value; sampledAt = System.currentTimeMillis();
                         boolean ready = value.optBoolean("upstreamAvailable", false);
+                        if (!summaryStageLogged) {
+                            summaryStageLogged = true;
+                            addLoadLog("STAGE 摘要 100");
+                            addLoadLog("摘要同步完成");
+                        }
                         updateLink(true, transportName() + " 已连接" + (ready ? "" : " · 部分数据不可用"));
                     }); });
                 } catch (Exception error) {
@@ -699,9 +766,11 @@ public final class MainActivity extends ComponentActivity {
         int position = preserve ? scroll.getScrollY() : scrollY; scrollY = 0; content.removeAllViews(); content.addView(label(PAGES[page], 26, text, true)); gap(content, 7);
         String last = status; if (!live && sampledAt != 0) last += " · 最后收到 " + DateFormat.getTimeInstance(DateFormat.MEDIUM).format(new Date(sampledAt)); note(last);
         if (paired != null && !live) {
+            note("总进度 " + overallPercent() + "% · " + currentStageName() + " " + (stagePercent.containsKey(currentStageName()) ? stagePercent.get(currentStageName()) : 0) + "%");
             ProgressBar syncBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-            syncBar.setIndeterminate(true);
-            content.addView(syncBar, lp(-1, dp(3)));
+            syncBar.setMax(100);
+            syncBar.setProgress(overallPercent());
+            content.addView(syncBar, lp(-1, dp(4)));
             gap(content, 7);
             if (!loadLog.isEmpty()) {
                 StringBuilder joined = new StringBuilder();

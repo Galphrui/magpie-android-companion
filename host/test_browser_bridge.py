@@ -203,6 +203,21 @@ class BrowserBridgeTests(unittest.TestCase):
         self.assertIn("immutable", matched["Cache-Control"])
         self.assertEqual(mismatched["Cache-Control"], "no-store")
 
+    def test_usb_browser_can_enable_hashed_cache_without_port_override(self):
+        server = bridge.BrowserServer(0, self.tls, self.token, self.browser.adapter, cache_assets=True)
+        original = self.browser
+        with serving(server):
+            self.browser = server
+            try:
+                session = self.sign_in()
+                _, matched, _ = self.request("/app.js?v=123456789abc", headers=session)
+                _, mismatched, _ = self.request("/app.js?v=000000000000", headers=session)
+                self.assertTrue(server.client_host.endswith(f":{server.server_port}"))
+                self.assertIn("immutable", matched["Cache-Control"])
+                self.assertEqual(mismatched["Cache-Control"], "no-store")
+            finally:
+                self.browser = original
+
     def test_stream_frames_arrive_before_upstream_closes(self):
         session = self.sign_in()
         try:

@@ -33,7 +33,7 @@ import java.util.regex.Pattern;
 /** Shows the connected computer's Magpie browser UI over its authenticated tunnel. */
 final class DesktopPage {
     static final int PICK_FILES = 515;
-    private static final Pattern STATIC_PATH = Pattern.compile("/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_.-]+\\.(?:m?js|css)");
+    private static final Pattern STATIC_PATH = Pattern.compile("/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_.-]+(?i:\\.(?:m?js|css|json|webmanifest|svg|png|ico|webp|jpe?g|woff2?|ttf|avif))");
     private static final Pattern ASSET_VERSION = Pattern.compile("v=[0-9a-f]{12}");
     private final Activity activity;
     private final BridgeClient bridge;
@@ -60,7 +60,9 @@ final class DesktopPage {
         settings.setAllowContentAccess(false);
         settings.setJavaScriptCanOpenWindowsAutomatically(false);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
-        settings.setCacheMode(bridge.isBluetooth() ? WebSettings.LOAD_DEFAULT : WebSettings.LOAD_NO_CACHE);
+        // Immutable, hash-versioned browser assets are safe to cache on every transport.
+        // Private APIs still obey the server's no-store headers.
+        settings.setCacheMode(WebSettings.LOAD_DEFAULT);
         CookieManager.getInstance().setAcceptThirdPartyCookies(view, false);
         // Keep the initial page load from stealing focus and opening the IME.
         // Web form controls still receive focus and show the keyboard normally
@@ -175,21 +177,53 @@ final class DesktopPage {
     }
 
     private WebResourceResponse cachedAsset(WebResourceRequest request) {
-        if (!bridge.isBluetooth() || request.isForMainFrame() || !"GET".equals(request.getMethod())) return null;
+        if (request.isForMainFrame() || !"GET".equals(request.getMethod())) return null;
         Uri url = request.getUrl();
         String path = url.getEncodedPath();
+        if ("/companion-android/magpie-interaction.js".equals(path)
+                || "/companion-android/magpie-landscape.css".equals(path)) {
+            try {
+                boolean stylesheet = path.endsWith(".css");
+                InputStream body = activity.getAssets().open(stylesheet
+                        ? "magpie-landscape.css" : "magpie-interaction.js");
+                return new WebResourceResponse(stylesheet ? "text/css" : "text/javascript", "UTF-8",
+                        200, "OK", Collections.singletonMap("Cache-Control", "no-store"), body);
+            } catch (IOException missing) {
+                return null;
+            }
+        }
         String query = url.getEncodedQuery();
         if (path == null || query == null || !STATIC_PATH.matcher(path).matches()
                 || !ASSET_VERSION.matcher(query).matches()) return null;
         try {
-            // Upstream's version query is the SHA-256 prefix of the immutable asset.
+            // Only exact SHA-256-versioned immutable assets are read from the APK cache.
             InputStream body = activity.getAssets().open("magpie-web/" + query.substring(2) + path);
-            String mime = path.endsWith(".css") ? "text/css" : "text/javascript";
-            return new WebResourceResponse(mime, "UTF-8", 200, "OK",
+            String mime = mimeType(path);
+            String encoding = mime.startsWith("text/") || "application/json".equals(mime)
+                    || mime.endsWith("+json") ? "UTF-8" : null;
+            return new WebResourceResponse(mime, encoding, 200, "OK",
                     Collections.singletonMap("Cache-Control", "private, max-age=31536000, immutable"), body);
         } catch (IOException missing) {
             return null;
         }
+    }
+
+    private static String mimeType(String path) {
+        String lower = path.toLowerCase(java.util.Locale.ROOT);
+        if (lower.endsWith(".css")) return "text/css";
+        if (lower.endsWith(".js") || lower.endsWith(".mjs")) return "text/javascript";
+        if (lower.endsWith(".json")) return "application/json";
+        if (lower.endsWith(".webmanifest")) return "application/manifest+json";
+        if (lower.endsWith(".svg")) return "image/svg+xml";
+        if (lower.endsWith(".png")) return "image/png";
+        if (lower.endsWith(".ico")) return "image/x-icon";
+        if (lower.endsWith(".webp")) return "image/webp";
+        if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+        if (lower.endsWith(".avif")) return "image/avif";
+        if (lower.endsWith(".woff2")) return "font/woff2";
+        if (lower.endsWith(".woff")) return "font/woff";
+        if (lower.endsWith(".ttf")) return "font/ttf";
+        return "application/octet-stream";
     }
 
     private boolean checkCertificate(SslCertificate sslCertificate) {

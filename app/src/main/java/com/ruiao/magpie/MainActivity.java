@@ -115,6 +115,10 @@ public final class MainActivity extends ComponentActivity {
             summarySelected = state.getBoolean("summary");
             scanAfterBluetoothReady = state.getBoolean("scanAfterBluetoothReady");
         }
+        // A USB handoff can cold-start the activity, bypassing onNewIntent.
+        if (isUsbPairUpdate(getIntent())) {
+            getPreferences(MODE_PRIVATE).edit().putBoolean(USE_BLUETOOTH, false).apply();
+        }
         getWindow().setAttributes(cutoutLayout(getWindow().getAttributes()));
         WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
         loadPairing(); applyOrientation(); makeLayout(); paint(false);
@@ -419,12 +423,20 @@ public final class MainActivity extends ComponentActivity {
             else showConnectionMessage("请开启手机蓝牙后再连接");
         }
     }
+    private boolean isUsbPairUpdate(Intent intent) {
+        return intent != null && (getPackageName() + UsbPairingProvider.ACTION_USB_PAIR_UPDATED)
+                .equals(intent.getAction());
+    }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent); setIntent(intent);
-        if ((getPackageName() + UsbPairingProvider.ACTION_USB_PAIR_UPDATED).equals(intent.getAction()) && !usesBluetooth()) {
-            stopStream(); loadPairing();
-            if (desktopFailed) attemptedDesktop = null;
-            snapshot = null; sampledAt = 0; displayKey = ""; connect();
+        if (isUsbPairUpdate(intent)) {
+            // A host-side ADB handoff is authoritative even when Bluetooth was
+            // previously selected. Keep saved BLE credentials for later, but
+            // immediately switch this session to the newly imported USB pairing.
+            clearBluetoothRecord();
+            pendingBluetooth = null;
+            getPreferences(MODE_PRIVATE).edit().putBoolean(USE_BLUETOOTH, false).apply();
+            resetConnection();
         }
     }
     @Override public void onConfigurationChanged(Configuration config) {

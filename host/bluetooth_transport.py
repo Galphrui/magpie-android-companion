@@ -59,6 +59,8 @@ class Relay:
         self.frames = asyncio.Queue(256)
         self.send_lock = asyncio.Lock()
         self.pong = asyncio.Event()
+        self.awaiting_pong = False
+        self.authenticated = False
         self.streams = {}
         self.stopped = False
         self.loop = asyncio.get_running_loop()
@@ -71,6 +73,13 @@ class Relay:
 
     def enqueue(self, frame):
         if self.stopped:
+            return
+        # A stream's local TCP drain can be slow; process the authenticated control
+        # response here so that it is not stuck behind ordinary stream dispatch.
+        if self.authenticated and frame == HEADER.pack(PONG, 0):
+            if self.awaiting_pong:
+                self.awaiting_pong = False
+                self.pong.set()
             return
         if self.frames.full():
             self.disconnect()
@@ -116,6 +125,7 @@ class Relay:
         await self.send(HOST_PROOF, payload=proof(self.token, b"host", desktop_nonce, phone_nonce))
         if await self.receive() != (READY, 0, b""):
             raise LinkError("phone did not complete verification")
+        self.authenticated = True
 
     def remove_stream(self, stream_id):
         stream = self.streams.pop(stream_id, None)
@@ -183,18 +193,20 @@ class Relay:
         await asyncio.gather(*(stream.task for stream in streams), return_exceptions=True)
 
     async def heartbeat(self):
-        async def ping():
-            await self.send(PING)
-            await self.pong.wait()
-
         while not self.stopped:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
             self.pong.clear()
+            self.awaiting_pong = True
             try:
-                await asyncio.wait_for(ping(), HEARTBEAT_TIMEOUT)
+                # Do not charge time waiting behind a data write against the phone's
+                # response budget; dispatch may be busy draining a different stream.
+                await self.send(PING)
+                await asyncio.wait_for(self.pong.wait(), HEARTBEAT_TIMEOUT)
             except (LinkError, asyncio.TimeoutError):
                 self.disconnect()
                 return
+            finally:
+                self.awaiting_pong = False
 
 
 class DesktopSession:
@@ -220,7 +232,8 @@ class DesktopSession:
             summary = self.stack.enter_context(
                 bridge.BridgeServer(0, tls, self.token, adapter, client_timeout=75))
             browser = self.stack.enter_context(
-                bridge.BrowserServer(0, tls, self.token, adapter, client_port=BROWSER_PORT, client_timeout=75))
+                bridge.BrowserServer(0, tls, self.token, adapter, client_port=BROWSER_PORT,
+                                     cache_assets=True, client_timeout=75))
             for server in (summary, browser):
                 threading.Thread(target=server.serve_forever, name="magpie-ble-http", daemon=True).start()
                 self.stack.callback(server.shutdown)
@@ -334,7 +347,10 @@ class DesktopSession:
             heartbeat = None
             try:
                 self.status("正在验证手机")
-                await asyncio.wait_for(client.start_notify(TX, relay.notification, force_indicate=True), IO_TIMEOUT)
+                characteristic = client.services.get_characteristic(TX)
+                force_indicate = characteristic is None or "notify" not in characteristic.properties
+                await asyncio.wait_for(
+                    client.start_notify(TX, relay.notification, force_indicate=force_indicate), IO_TIMEOUT)
                 await asyncio.wait_for(relay.authenticate(), HANDSHAKE_TIMEOUT)
                 self.status("蓝牙已连接")
                 if ready is not None:

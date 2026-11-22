@@ -36,12 +36,13 @@ APK 内置 Magpie v0.1.4622 的版本化 JavaScript 和 CSS。完整电脑界面
 
 1. 启动 Mac 版 Magpie，在设置中将 Browser access 设为本机访问。
 2. 将已授权 USB 调试的 Android 手机连接到 Mac。
-3. 运行下列命令安装正式版并启动完整 USB 管理界面。
+3. 在 Mac 终端运行安装命令。安装完成后会注册当前用户的 LaunchAgent，每分钟检查 ADB；检测到已授权实体手机时自动建立 USB 反向通道、导入短时配对信息并启动/切换 Android APP，无需在扫描页手动操作。
 
 ```bash
 bash tools/setup_mac_android.sh
-bash tools/usb_start.sh --full-browser
 ```
+
+如需排查，可在不运行自动服务时手动启动桥接：`bash tools/usb_start.sh --full-browser`。请勿同时运行手动桥接与 LaunchAgent。
 
 摘要桥和局域网模式的参数见 [Mac 桥接说明](host/README.txt)。
 

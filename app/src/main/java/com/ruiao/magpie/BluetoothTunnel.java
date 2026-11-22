@@ -100,7 +100,7 @@ final class BluetoothTunnel implements Closeable {
     private Frame sending;
     private byte[] hostNonce, phoneNonce;
     private Runnable pairingTimeout;
-    private boolean serviceAdded, advertising, subscribed;
+    private boolean serviceAdded, advertising, subscribed, indications;
     private int lastStreamId, bindAttempts;
     private volatile int frameSize = MIN_FRAME;
     private volatile boolean paired, closed;
@@ -160,7 +160,9 @@ final class BluetoothTunnel implements Closeable {
             BluetoothGattService service = new BluetoothGattService(serviceId, BluetoothGattService.SERVICE_TYPE_PRIMARY);
             service.addCharacteristic(new BluetoothGattCharacteristic(WRITE_UUID,
                     BluetoothGattCharacteristic.PROPERTY_WRITE, BluetoothGattCharacteristic.PERMISSION_WRITE));
-            sendCharacteristic = new BluetoothGattCharacteristic(SEND_UUID, BluetoothGattCharacteristic.PROPERTY_INDICATE, 0);
+            int sendProperties = BluetoothGattCharacteristic.PROPERTY_INDICATE
+                    | (Build.VERSION.SDK_INT >= 33 ? BluetoothGattCharacteristic.PROPERTY_NOTIFY : 0);
+            sendCharacteristic = new BluetoothGattCharacteristic(SEND_UUID, sendProperties, 0);
             sendCharacteristic.addDescriptor(new BluetoothGattDescriptor(CCCD,
                     BluetoothGattDescriptor.PERMISSION_READ | BluetoothGattDescriptor.PERMISSION_WRITE));
             service.addCharacteristic(sendCharacteristic);
@@ -270,8 +272,9 @@ final class BluetoothTunnel implements Closeable {
                                                        BluetoothGattDescriptor descriptor) {
             postSafely(() -> {
                 boolean valid = device.equals(peer) && canReadSubscription(descriptor) && offset == 0;
-                byte[] value = subscribed ? BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-                        : BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE;
+                byte[] value = !subscribed ? BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+                        : indications ? BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                        : BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE;
                 respond(device, requestId, valid, valid ? value : null);
             });
         }
@@ -282,11 +285,16 @@ final class BluetoothTunnel implements Closeable {
                                                         int offset, byte[] value) {
             postSafely(() -> {
                 if (closed) return;
-                boolean enabled = Arrays.equals(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE, value);
+                boolean indication = Arrays.equals(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE, value);
+                boolean notification = Arrays.equals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE, value);
+                boolean enabled = indication || notification;
                 boolean disabled = Arrays.equals(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE, value);
                 boolean valid = peer != null && device.equals(peer) && canReadSubscription(descriptor)
                         && offset == 0 && !preparedWrite && (enabled || disabled);
-                if (valid) subscribed = enabled;
+                if (valid) {
+                    subscribed = enabled;
+                    indications = indication;
+                }
                 if (responseNeeded) respond(device, requestId, valid, null);
                 if (valid && disabled && hostNonce != null) dropPeer("蓝牙已取消订阅，正在等待重连");
             });
@@ -449,7 +457,7 @@ final class BluetoothTunnel implements Closeable {
         try {
             boolean sent;
             if (Build.VERSION.SDK_INT >= 33) {
-                sent = gatt.notifyCharacteristicChanged(peer, sendCharacteristic, true, frame.bytes)
+                sent = gatt.notifyCharacteristicChanged(peer, sendCharacteristic, indications, frame.bytes)
                         == BluetoothStatusCodes.SUCCESS;
             } else {
                 sendCharacteristic.setValue(frame.bytes);
@@ -615,6 +623,7 @@ final class BluetoothTunnel implements Closeable {
         peer = null;
         hostNonce = phoneNonce = null;
         subscribed = false;
+        indications = false;
         frameSize = MIN_FRAME;
         paired = false;
         if (hadPeerState) reportConnection(false);

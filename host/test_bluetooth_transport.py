@@ -109,6 +109,24 @@ class BluetoothRelayTests(unittest.IsolatedAsyncioTestCase):
                 await session._connect_with_timeout(None, None)
         self.assertTrue(cancelled.is_set())
 
+    async def test_authenticated_pong_bypasses_full_stream_dispatch_queue(self):
+        self.relay.authenticated = True
+        self.relay.awaiting_pong = True
+        for _ in range(self.relay.frames.maxsize):
+            self.relay.frames.put_nowait(ble.HEADER.pack(ble.DATA, 1) + b"x")
+        self.send_phone(ble.PONG)
+        self.assertTrue(self.relay.pong.is_set())
+        self.assertFalse(self.relay.stopped)
+        self.assertTrue(self.relay.frames.full())
+        self.assertFalse(self.relay.awaiting_pong)
+
+    async def test_stale_authenticated_pong_is_discarded(self):
+        self.relay.authenticated = True
+        self.send_phone(ble.PONG)
+        self.assertFalse(self.relay.pong.is_set())
+        self.assertFalse(self.relay.stopped)
+        self.assertTrue(self.relay.frames.empty())
+
     async def test_heartbeat_disconnects_when_phone_stops_responding(self):
         with patch.object(ble, "HEARTBEAT_INTERVAL", 0), patch.object(ble, "HEARTBEAT_TIMEOUT", 0.1):
             await self.relay.heartbeat()

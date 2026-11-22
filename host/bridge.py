@@ -821,10 +821,11 @@ class BrowserHandler(BridgeHandler):
 
 
 class BrowserServer(BridgeServer):
-    def __init__(self, port, tls, token, adapter, *, client_port=None, client_timeout=CLIENT_TIMEOUT):
+    def __init__(self, port, tls, token, adapter, *, client_port=None, cache_assets=False,
+                 client_timeout=CLIENT_TIMEOUT):
         super().__init__(port, tls, token, adapter, handler=BrowserHandler, client_timeout=client_timeout)
         self.adapter = adapter
-        self.cache_assets = client_port is not None
+        self.cache_assets = bool(cache_assets)
         self.browser_token = secrets.token_urlsafe(32)
         self.client_host = f"{HOST}:{client_port if client_port is not None else self.server_port}"
         self.origin = f"https://{self.client_host}"
@@ -1007,7 +1008,8 @@ def main(argv=None):
                 browser_server = None
                 try:
                     if args.full_browser:
-                        browser_server = BrowserServer(BROWSER_PORT, tls, token, adapter).launch()
+                        browser_server = BrowserServer(BROWSER_PORT, tls, token, adapter,
+                                                       cache_assets=True).launch()
                         print(f"Magpie full browser available on USB loopback port {BROWSER_PORT}", file=sys.stderr)
                     if args.pairing_file:
                         write_pairing_file(args.pairing_file, args.port, fingerprint, token)

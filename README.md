@@ -16,7 +16,11 @@
 桌面需要 Windows 10 1709 或更新版本、Windows 11，或 macOS，以及支持低功耗蓝牙的适配器。使用带 Tk 的 Python 3.10+。Windows 的 Python 安装选项中需包含 Tcl/Tk。macOS 启动脚本需要 Framework 版 Python，可使用 [python.org 安装包](https://www.python.org/downloads/macos/)。
 
 1. 启动上游 Magpie，在「设置 → 网络与共享 → 浏览器访问」选择「本机」。
-2. Windows 双击 [start-bluetooth.cmd](tools/start-bluetooth.cmd)。macOS 双击 [start-bluetooth.command](tools/start-bluetooth.command)。首次启动在用户目录创建 Python 环境并下载安装依赖。macOS 首次连接时，请在系统提示中允许 Magpie 蓝牙配置使用蓝牙。
+2. 双击仓库根目录的启动器打开「Magpie 蓝牙配置」窗口：
+   - Windows：双击 `启动Magpie蓝牙.cmd`
+   - macOS：双击 `启动Magpie蓝牙.command`
+
+   首次启动会在用户目录创建 Python 环境并下载安装依赖；之后双击即可直接打开。macOS 首次连接时，请在系统提示中允许 Magpie 蓝牙配置使用蓝牙。Windows 若提示脚本策略，右键选择「以管理员身份运行」或按提示解除阻止。
 3. 打开 Android 伴侣端，在手机设置中选择「扫描蓝牙二维码」。授权后扫描桌面程序显示的二维码，也可以在扫描页选择「从图片识别」。
 4. 配对后，手机会先同步智能体、网关和路由摘要。要查看用量、请求或会话，请点「打开完整电脑界面」。保持桌面程序运行。停止连接再启动会生成新二维码，需要重新扫描。
 

@@ -89,6 +89,9 @@ class BluetoothConfigurationTests(unittest.TestCase):
             def set(self, value):
                 self.value = value
 
+            def get(self):
+                return self.value
+
         class Tk:
             BOTH = "both"
             W = "w"
@@ -105,6 +108,7 @@ class BluetoothConfigurationTests(unittest.TestCase):
         class Ttk:
             Frame = lambda *_args, **options: Widget(**options)
             Label = lambda *_args, **options: Widget(**options)
+            Button = lambda *_args, **options: Widget(**options)
             Progressbar = lambda *_args, **options: Widget(**options)
             LabelFrame = lambda *_args, **options: Widget(**options)
             Scrollbar = lambda *_args, **options: Widget(**options)
@@ -116,7 +120,7 @@ class BluetoothConfigurationTests(unittest.TestCase):
         with patch.object(configure.ConfigWindow, "start") as start:
             window = configure.ConfigWindow(root, Tk, Ttk, QRCode)
 
-        self.assertEqual(set(root.callbacks), {80, "idle"})
+        self.assertEqual(set(root.callbacks), {80, 300, "idle"})
         root.callbacks["idle"]()
         start.assert_called_once_with()
 

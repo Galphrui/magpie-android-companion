@@ -26,7 +26,7 @@
 
 安装版 Magpie 的浏览器配置通常位于用户目录下的 `.config/magpie/web-page.json`。使用自定义配置时，启动桌面程序前将 `MAGPIE_CONFIG_DIR` 设为包含 `web-page.json` 的目录。蓝牙连接使用二维码中的配对凭据，Web 管理流量通过 TLS 传输。配对期间请把二维码留在自己的电脑屏幕上。
 
-APK 内置 Magpie v0.1.4622 的版本化 JavaScript 和 CSS。完整电脑界面直接读取哈希匹配的资源，并通过蓝牙获取当前数据。桌面 Magpie 更新后，改变的资源由配对电脑提供。更新内置资源时，从对应版本的上游 Git checkout 运行 `python3 tools/build_web_asset_cache.py /path/to/magpie`。
+APK 内置 Magpie v0.1.4676 的版本化 JavaScript 和 CSS。完整电脑界面直接读取哈希匹配的资源，并通过蓝牙获取当前数据。桌面 Magpie 更新后，改变的资源由配对电脑提供。更新内置资源时，从对应版本的上游 Git checkout 运行 `python3 tools/build_web_asset_cache.py /path/to/magpie`。
 
 ## 构建与 USB 连接
 

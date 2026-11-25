@@ -13,7 +13,10 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 
 ASSETS = "internal/gui/assets/"
-ASSET_PATH = re.compile(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.(?:js|css)")
+ASSET_PATH = re.compile(
+    r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.(?:m?js|css|json|webmanifest|svg|png|ico|webp|jpe?g|woff2?|ttf|avif)",
+    re.IGNORECASE,
+)
 OUTPUT = Path(__file__).resolve().parents[1] / "app/web-assets.zip"
 
 

@@ -40,6 +40,7 @@ CONCURRENCY, TRACE = "/v1/magpie/concurrency", "/v1/magpie/trace"
 CURRENCIES = frozenset(("usd", "cny", "provider"))
 POLL, HEARTBEAT, TRACE_POLL = 5.0, 5.0, 10.0
 UPSTREAM_TIMEOUT, CLIENT_TIMEOUT, CLI_TIMEOUT = 2.0, 5.0, 6.0
+KEEPALIVE_IDLE = 20.0
 MAX_STATE, MAX_GATEWAY, MAX_COMMAND = 2 << 20, 1 << 20, 1024
 MAX_CLIENTS, MAX_STREAMS, MAX_EVENT = 12, 4, 60 << 10
 BROWSER_KEY = re.compile(r"[A-Za-z0-9._~-]{16,128}\Z")
@@ -659,6 +660,7 @@ class BrowserHandler(BridgeHandler):
         return len(supplied) == len(expected) and supplied.isascii() and hmac.compare_digest(supplied, expected)
 
     def _open_session(self):
+        self.close_connection = True
         headers = self.headers.get_all("Authorization", [])
         if self.command != "GET" or len(headers) != 1 or not self._same_secret(headers[0], self.server.bearer):
             return self._reply(401, "unauthorized")
@@ -677,7 +679,6 @@ class BrowserHandler(BridgeHandler):
         return False
 
     def _serve_browser(self):
-        self.close_connection = True
         origin = self.server.origin
         client_host = self.server.client_host
         origins = self.headers.get_all("Origin", [])
@@ -784,6 +785,11 @@ class BrowserHandler(BridgeHandler):
                 upstream.close()
 
     def _relay_response(self, response, patched=None, immutable=False, encoding=None):
+        progress = getattr(self.server, "progress", None)
+        if progress is not None and self.command == "GET" and response.status == 200:
+            length = response.headers.get("Content-Length")
+            if length is not None and length.isdigit():
+                progress.add_expected(int(length))
         self.send_response(response.status)
         connection_options = {
             option.strip().lower()
@@ -808,7 +814,17 @@ class BrowserHandler(BridgeHandler):
             self.send_header("Content-Length", str(len(patched)))
         if encoding:
             self.send_header("Content-Encoding", encoding)
-        self.send_header("Connection", "close")
+        # Keep the TLS/BLE connection open across requests (the WebView issues many
+        # small /api and asset requests per page switch) whenever the response body
+        # is self-delimiting. Reusing one tunnel stream avoids a fresh BLE open plus
+        # a full TLS handshake over BLE for every single request.
+        keep_alive = (self.request_version != "HTTP/1.0" and not self.close_connection
+                      and not response.chunked
+                      and (patched is not None or response.headers.get("Content-Length") is not None))
+        self.close_connection = not keep_alive
+        self.send_header("Connection", "keep-alive" if keep_alive else "close")
+        if keep_alive:
+            self.send_header("Keep-Alive", f"timeout={int(KEEPALIVE_IDLE)}")
         self.send_header("Cache-Control", "private, max-age=31536000, immutable" if immutable else "no-store")
         self.end_headers()
         if patched is not None:
@@ -816,15 +832,25 @@ class BrowserHandler(BridgeHandler):
         elif self.command != "HEAD":
             while part := response.read1(64 << 10):
                 self.wfile.write(part)
+        if keep_alive:
+            self.wfile.flush()
+            # Allow the next request on this connection a longer idle window than the
+            # tight handshake timeout, so a burst of page requests reuses one stream.
+            try:
+                self.connection.settimeout(KEEPALIVE_IDLE)
+            except OSError:
+                pass
 
     do_GET = do_HEAD = do_POST = do_PUT = do_PATCH = do_DELETE = _serve_browser
 
 
 class BrowserServer(BridgeServer):
-    def __init__(self, port, tls, token, adapter, *, client_port=None, client_timeout=CLIENT_TIMEOUT):
+    def __init__(self, port, tls, token, adapter, *, client_port=None, cache_assets=False,
+                 client_timeout=CLIENT_TIMEOUT, progress=None):
         super().__init__(port, tls, token, adapter, handler=BrowserHandler, client_timeout=client_timeout)
         self.adapter = adapter
-        self.cache_assets = client_port is not None
+        self.cache_assets = bool(cache_assets)
+        self.progress = progress
         self.browser_token = secrets.token_urlsafe(32)
         self.client_host = f"{HOST}:{client_port if client_port is not None else self.server_port}"
         self.origin = f"https://{self.client_host}"
@@ -1007,7 +1033,8 @@ def main(argv=None):
                 browser_server = None
                 try:
                     if args.full_browser:
-                        browser_server = BrowserServer(BROWSER_PORT, tls, token, adapter).launch()
+                        browser_server = BrowserServer(BROWSER_PORT, tls, token, adapter,
+                                                       cache_assets=True).launch()
                         print(f"Magpie full browser available on USB loopback port {BROWSER_PORT}", file=sys.stderr)
                     if args.pairing_file:
                         write_pairing_file(args.pairing_file, args.port, fingerprint, token)

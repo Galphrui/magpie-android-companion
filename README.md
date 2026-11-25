@@ -16,7 +16,11 @@
 桌面需要 Windows 10 1709 或更新版本、Windows 11，或 macOS，以及支持低功耗蓝牙的适配器。使用带 Tk 的 Python 3.10+。Windows 的 Python 安装选项中需包含 Tcl/Tk。macOS 启动脚本需要 Framework 版 Python，可使用 [python.org 安装包](https://www.python.org/downloads/macos/)。
 
 1. 启动上游 Magpie，在「设置 → 网络与共享 → 浏览器访问」选择「本机」。
-2. Windows 双击 [start-bluetooth.cmd](tools/start-bluetooth.cmd)。macOS 双击 [start-bluetooth.command](tools/start-bluetooth.command)。首次启动在用户目录创建 Python 环境并下载安装依赖。macOS 首次连接时，请在系统提示中允许 Magpie 蓝牙配置使用蓝牙。
+2. 双击仓库根目录的启动器打开「Magpie 蓝牙配置」窗口：
+   - Windows：双击 `启动Magpie蓝牙.cmd`
+   - macOS：双击 `启动Magpie蓝牙.command`
+
+   首次启动会在用户目录创建 Python 环境并下载安装依赖；之后双击即可直接打开。macOS 首次连接时，请在系统提示中允许 Magpie 蓝牙配置使用蓝牙。Windows 若提示脚本策略，右键选择「以管理员身份运行」或按提示解除阻止。
 3. 打开 Android 伴侣端，在手机设置中选择「扫描蓝牙二维码」。授权后扫描桌面程序显示的二维码，也可以在扫描页选择「从图片识别」。
 4. 配对后，手机会先同步智能体、网关和路由摘要。要查看用量、请求或会话，请点「打开完整电脑界面」。保持桌面程序运行。停止连接再启动会生成新二维码，需要重新扫描。
 
@@ -36,12 +40,13 @@ APK 内置 Magpie v0.1.4622 的版本化 JavaScript 和 CSS。完整电脑界面
 
 1. 启动 Mac 版 Magpie，在设置中将 Browser access 设为本机访问。
 2. 将已授权 USB 调试的 Android 手机连接到 Mac。
-3. 运行下列命令安装正式版并启动完整 USB 管理界面。
+3. 在 Mac 终端运行安装命令。安装完成后会注册当前用户的 LaunchAgent，每分钟检查 ADB；检测到已授权实体手机时自动建立 USB 反向通道、导入短时配对信息并启动/切换 Android APP，无需在扫描页手动操作。
 
 ```bash
 bash tools/setup_mac_android.sh
-bash tools/usb_start.sh --full-browser
 ```
+
+如需排查，可在不运行自动服务时手动启动桥接：`bash tools/usb_start.sh --full-browser`。请勿同时运行手动桥接与 LaunchAgent。
 
 摘要桥和局域网模式的参数见 [Mac 桥接说明](host/README.txt)。
 

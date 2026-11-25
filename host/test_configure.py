@@ -33,6 +33,33 @@ class BluetoothConfigurationTests(unittest.TestCase):
             def bind(self, *_args):
                 pass
 
+            def configure(self, **_options):
+                pass
+
+            def insert(self, *_args):
+                pass
+
+            def index(self, _position):
+                return "2.0"
+
+            def delete(self, *_args):
+                pass
+
+            def see(self, _position):
+                pass
+
+            def yview(self, *_args):
+                pass
+
+            def set(self, *_args):
+                pass
+
+            def start(self, _interval=None):
+                pass
+
+            def stop(self):
+                pass
+
         class Root:
             def __init__(self):
                 self.callbacks = {}
@@ -62,16 +89,29 @@ class BluetoothConfigurationTests(unittest.TestCase):
             def set(self, value):
                 self.value = value
 
+            def get(self):
+                return self.value
+
         class Tk:
             BOTH = "both"
             W = "w"
+            X = "x"
+            END = "end"
+            Y = "y"
+            LEFT = "left"
+            RIGHT = "right"
             Canvas = lambda *_args, **options: Widget(**options)
+            Text = lambda *_args, **options: Widget(**options)
 
         Tk.StringVar = StringVar
 
         class Ttk:
             Frame = lambda *_args, **options: Widget(**options)
             Label = lambda *_args, **options: Widget(**options)
+            Button = lambda *_args, **options: Widget(**options)
+            Progressbar = lambda *_args, **options: Widget(**options)
+            LabelFrame = lambda *_args, **options: Widget(**options)
+            Scrollbar = lambda *_args, **options: Widget(**options)
 
         class QRCode:
             pass
@@ -80,7 +120,7 @@ class BluetoothConfigurationTests(unittest.TestCase):
         with patch.object(configure.ConfigWindow, "start") as start:
             window = configure.ConfigWindow(root, Tk, Ttk, QRCode)
 
-        self.assertEqual(set(root.callbacks), {80, "idle"})
+        self.assertEqual(set(root.callbacks), {80, 300, "idle"})
         root.callbacks["idle"]()
         start.assert_called_once_with()
 
@@ -88,6 +128,114 @@ class BluetoothConfigurationTests(unittest.TestCase):
         configure._put_event(window.events, 1, "finished", None)
         window.poll()
         self.assertNotIn(3000, root.callbacks)
+
+    def test_start_launches_worker_and_logging_uses_injected_tk(self):
+        class Widget:
+            def __init__(self, **options):
+                self.inserted = []
+
+            def pack(self, **_options):
+                pass
+
+            def bind(self, *_args):
+                pass
+
+            def configure(self, **_options):
+                pass
+
+            def insert(self, *args):
+                self.inserted.append(args)
+
+            def index(self, _position):
+                return "2.0"
+
+            def delete(self, *_args):
+                pass
+
+            def see(self, _position):
+                pass
+
+            def yview(self, *_args):
+                pass
+
+            def set(self, *_args):
+                pass
+
+            def start(self, _interval=None):
+                pass
+
+            def stop(self):
+                pass
+
+        class Root:
+            def __init__(self):
+                self.callbacks = {}
+
+            def title(self, _title):
+                pass
+
+            def minsize(self, *_size):
+                pass
+
+            def protocol(self, *_args):
+                pass
+
+            def after(self, delay, callback):
+                self.callbacks[delay] = callback
+
+            def after_idle(self, callback):
+                self.callbacks["idle"] = callback
+
+            def destroy(self):
+                pass
+
+        class StringVar:
+            def __init__(self, value=""):
+                self.value = value
+
+            def set(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        class Tk:
+            BOTH = "both"
+            W = "w"
+            X = "x"
+            END = "end"
+            Y = "y"
+            LEFT = "left"
+            RIGHT = "right"
+            Canvas = lambda *_args, **options: Widget(**options)
+            Text = lambda *_args, **options: Widget(**options)
+
+        Tk.StringVar = StringVar
+
+        class Ttk:
+            Frame = lambda *_args, **options: Widget(**options)
+            Label = lambda *_args, **options: Widget(**options)
+            Button = lambda *_args, **options: Widget(**options)
+            Progressbar = lambda *_args, **options: Widget(**options)
+            LabelFrame = lambda *_args, **options: Widget(**options)
+            Scrollbar = lambda *_args, **options: Widget(**options)
+
+        class QRCode:
+            pass
+
+        root = Root()
+        with patch.object(configure.threading, "Thread") as thread:
+            thread.return_value.start = lambda: None
+            window = configure.ConfigWindow(root, Tk, Ttk, QRCode)
+            # start() logs a status line before spawning the worker; this used to
+            # raise NameError ('tk' is not defined) and abort before the thread
+            # launched, leaving the window stuck on "正在生成二维码…".
+            window.start()
+            window._append_log("hello")
+        thread.assert_called_once()
+        self.assertIs(thread.call_args.kwargs.get("target"), configure.run_worker)
+        self.assertEqual(window.log_text.inserted[-1][0], "end")
+        self.assertIn("hello", window.log_text.inserted[-1][1])
 
     def test_stop_cancels_the_running_session_and_waits_for_cleanup(self):
         stop = threading.Event()

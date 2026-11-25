@@ -21,6 +21,7 @@ TX = "3a53a032-1eef-4c97-8c9a-15ac27a9f2a2"
 SUMMARY_PORT, BROWSER_PORT = 43435, 43437
 HELLO, PHONE_NONCE, PHONE_PROOF, HOST_PROOF, READY = range(1, 6)
 PING, PONG = 6, 7
+LOG = 8
 OPEN, DATA, FIN, RESET = range(16, 20)
 HEADER = struct.Struct(">BH")
 MAX_FRAME = 244
@@ -31,6 +32,7 @@ PAIRING_TTL = 60
 PAIRING_TIMEOUT = 35
 CONNECT_TIMEOUT = 8
 HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT = 3, 5
+PROGRESS_INTERVAL = 0.5
 MAX_STREAMS = 12
 
 
@@ -49,21 +51,114 @@ class Stream:
     task: asyncio.Task | None = None
     phone_finished: bool = False
     host_finished: bool = False
+    channel: int = 0
+
+
+class LoadProgress:
+    """Byte-level progress for the browser download stage, shared with the UI."""
+
+    def __init__(self, desktop=lambda text: None):
+        self.desktop = desktop
+        self.phone = None
+        self.expected = 0
+        self.delivered = 0
+        self._last = 0.0
+
+    def attach_phone(self, sender):
+        self.phone = sender
+
+    def add_expected(self, size):
+        self.expected += max(0, int(size))
+
+    def add_delivered(self, size):
+        self.delivered += max(0, int(size))
+        self._maybe_emit()
+
+    def _emit(self, text):
+        try:
+            self.desktop(text)
+        except Exception:
+            pass
+        if self.phone is not None:
+            self.phone(text)
+
+    def _maybe_emit(self):
+        now = time.monotonic()
+        if now - self._last < 0.5:
+            return
+        self._last = now
+        percent = min(100, int(100 * self.delivered / self.expected)) if self.expected else 0
+        self._emit(f"STAGE 界面 {percent}")
+        self._emit(f"界面加载 {percent}%（已下载 {self.delivered / 1024:.0f} KB / 共 {self.expected / 1024:.0f} KB）")
 
 
 class Relay:
     """One authenticated BLE connection and its bounded set of TCP streams."""
 
-    def __init__(self, client, token, ports):
+    def __init__(self, client, token, ports, progress=None, load=None):
         self.client, self.token, self.ports = client, token, ports
+        self.progress = progress
+        self.load = load
         self.frames = asyncio.Queue(256)
         self.send_lock = asyncio.Lock()
         self.pong = asyncio.Event()
+        self.awaiting_pong = False
+        self.authenticated = False
         self.streams = {}
         self.stopped = False
         self.loop = asyncio.get_running_loop()
         # Every frame is a single ATT value, including on low-MTU Bluetooth adapters.
         self.payload_size = max(20, min(MAX_FRAME, client.mtu_size - 3)) - HEADER.size
+        self.bytes_to_phone = 0
+        self.bytes_from_phone = 0
+        self._last_progress = 0.0
+        self._last_sent = 0
+        self._last_received = 0
+
+    def _log(self, text):
+        if self.stopped:
+            return
+        if self.progress is not None:
+            try:
+                self.progress(text)
+            except Exception:
+                pass
+        if self.authenticated:
+            asyncio.create_task(self._send_log(text))
+
+    async def _send_log(self, text):
+        # LOG text can exceed one low-MTU frame. Pack complete characters so a
+        # frame never splits a multi-byte UTF-8 sequence, then end with an empty
+        # frame so the phone knows where each message boundary is.
+        pieces, current = [], b""
+        limit = max(1, self.payload_size)
+        for character in text:
+            encoded = character.encode("utf-8")
+            if current and len(current) + len(encoded) > limit:
+                pieces.append(current)
+                current = encoded
+            else:
+                current += encoded
+        if current:
+            pieces.append(current)
+        for piece in pieces:
+            with suppress(LinkError, OSError, asyncio.TimeoutError):
+                await self.send(LOG, payload=piece)
+        with suppress(LinkError, OSError, asyncio.TimeoutError):
+            await self.send(LOG, payload=b"")
+
+    def _account(self):
+        now = time.monotonic()
+        sent, received = self.bytes_to_phone, self.bytes_from_phone
+        if now - self._last_progress < PROGRESS_INTERVAL:
+            return
+        if sent == self._last_sent and received == self._last_received:
+            return
+        elapsed = now - self._last_progress or PROGRESS_INTERVAL
+        rate = ((sent - self._last_sent) + (received - self._last_received)) / 1024 / elapsed
+        self._last_progress = now
+        self._last_sent, self._last_received = sent, received
+        self._log(f"蓝牙传输 下行 {sent / 1024:.0f} KB · 上行 {received / 1024:.0f} KB · {rate:.0f} KB/s")
 
     def notification(self, _characteristic, value):
         if not self.loop.is_closed():
@@ -71,6 +166,13 @@ class Relay:
 
     def enqueue(self, frame):
         if self.stopped:
+            return
+        # A stream's local TCP drain can be slow; process the authenticated control
+        # response here so that it is not stuck behind ordinary stream dispatch.
+        if self.authenticated and frame == HEADER.pack(PONG, 0):
+            if self.awaiting_pong:
+                self.awaiting_pong = False
+                self.pong.set()
             return
         if self.frames.full():
             self.disconnect()
@@ -88,14 +190,24 @@ class Relay:
                 raise LinkError("disconnected")
             if len(payload) > self.payload_size:
                 raise LinkError("invalid frame size")
+            # Bulk DATA uses write-without-response so the controller can pipeline
+            # frames instead of waiting for one ATT confirmation per frame. Control
+            # frames keep the confirmed write path for reliable delivery.
+            response = opcode != DATA
             try:
                 await asyncio.wait_for(
-                    self.client.write_gatt_char(RX, HEADER.pack(opcode, stream_id) + payload, response=True),
+                    self.client.write_gatt_char(RX, HEADER.pack(opcode, stream_id) + payload, response=response),
                     IO_TIMEOUT,
                 )
             except Exception as error:
                 self.disconnect()
                 raise LinkError("could not send BLE frame") from error
+            if opcode == DATA:
+                self.bytes_to_phone += len(payload)
+                stream = self.streams.get(stream_id)
+                if self.load is not None and stream is not None and stream.channel == 2:
+                    self.load.add_delivered(len(payload))
+                self._account()
 
     async def receive(self):
         frame = await self.frames.get()
@@ -116,6 +228,11 @@ class Relay:
         await self.send(HOST_PROOF, payload=proof(self.token, b"host", desktop_nonce, phone_nonce))
         if await self.receive() != (READY, 0, b""):
             raise LinkError("phone did not complete verification")
+        self.authenticated = True
+        if self.load is not None:
+            self.load.attach_phone(lambda text: asyncio.create_task(self._send_log(text)))
+        self._log("STAGE 配对 100")
+        self._log("蓝牙配对完成，开始同步数据")
 
     def remove_stream(self, stream_id):
         stream = self.streams.pop(stream_id, None)
@@ -156,13 +273,22 @@ class Relay:
                 await self.send(RESET, stream_id)
                 return
             stream = Stream(writer)
+            stream.channel = payload[0]
             self.streams[stream_id] = stream
             stream.task = asyncio.create_task(self.pump(stream_id, stream, reader))
+            if payload[0] == 1:
+                self._log("STAGE 通道 50")
+                self._log("已建立摘要通道")
+            else:
+                self._log("STAGE 通道 100")
+                self._log("已建立浏览器通道")
         elif stream is not None:
             try:
                 if opcode == DATA and payload and not stream.phone_finished:
                     stream.writer.write(payload)
                     await asyncio.wait_for(stream.writer.drain(), IO_TIMEOUT)
+                    self.bytes_from_phone += len(payload)
+                    self._account()
                 elif opcode == FIN and not payload and not stream.phone_finished:
                     stream.phone_finished = True
                     if stream.host_finished:
@@ -183,18 +309,20 @@ class Relay:
         await asyncio.gather(*(stream.task for stream in streams), return_exceptions=True)
 
     async def heartbeat(self):
-        async def ping():
-            await self.send(PING)
-            await self.pong.wait()
-
         while not self.stopped:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
             self.pong.clear()
+            self.awaiting_pong = True
             try:
-                await asyncio.wait_for(ping(), HEARTBEAT_TIMEOUT)
+                # Do not charge time waiting behind a data write against the phone's
+                # response budget; dispatch may be busy draining a different stream.
+                await self.send(PING)
+                await asyncio.wait_for(self.pong.wait(), HEARTBEAT_TIMEOUT)
             except (LinkError, asyncio.TimeoutError):
                 self.disconnect()
                 return
+            finally:
+                self.awaiting_pong = False
 
 
 class DesktopSession:
@@ -217,10 +345,12 @@ class DesktopSession:
             folder = self.stack.enter_context(tempfile.TemporaryDirectory(prefix="magpie-ble-"))
             tls, self.fingerprint = bridge.make_tls(folder, portable=True)
             adapter = bridge.Magpie(self.browser_port, self.gateway_port, self.browser_key, self.token)
+            self.load = LoadProgress(desktop=self.status)
             summary = self.stack.enter_context(
                 bridge.BridgeServer(0, tls, self.token, adapter, client_timeout=75))
             browser = self.stack.enter_context(
-                bridge.BrowserServer(0, tls, self.token, adapter, client_port=BROWSER_PORT, client_timeout=75))
+                bridge.BrowserServer(0, tls, self.token, adapter, client_port=BROWSER_PORT,
+                                     cache_assets=True, client_timeout=75, progress=self.load))
             for server in (summary, browser):
                 threading.Thread(target=server.serve_forever, name="magpie-ble-http", daemon=True).start()
                 self.stack.callback(server.shutdown)
@@ -330,11 +460,15 @@ class DesktopSession:
                     device = await self._find_phone(CONNECT_TIMEOUT)
                     if device is None:
                         raise
-            relay = Relay(client, self.token, self.ports)
+            relay = Relay(client, self.token, self.ports, progress=self.status, load=self.load)
             heartbeat = None
             try:
                 self.status("正在验证手机")
-                await asyncio.wait_for(client.start_notify(TX, relay.notification, force_indicate=True), IO_TIMEOUT)
+                self.status("STAGE 配对 50")
+                characteristic = client.services.get_characteristic(TX)
+                force_indicate = characteristic is None or "notify" not in characteristic.properties
+                await asyncio.wait_for(
+                    client.start_notify(TX, relay.notification, force_indicate=force_indicate), IO_TIMEOUT)
                 await asyncio.wait_for(relay.authenticate(), HANDSHAKE_TIMEOUT)
                 self.status("蓝牙已连接")
                 if ready is not None:

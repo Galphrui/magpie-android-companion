@@ -366,6 +366,49 @@ class BridgeTests(unittest.TestCase):
             self.mode = "big"
             self.event(resp, lambda x: not x["upstreamAvailable"])
 
+    def start_browser(self, cache_assets=False):
+        self.token = secrets.token_urlsafe(32)
+        adapter = bridge.Magpie(self.web.server_port, self.gateway.server_port, KEY, self.token)
+        self.browser = self.stack.enter_context(serving(bridge.BrowserServer(
+            0, self.tls, self.token, adapter, cache_assets=cache_assets)))
+        return self.browser
+
+    def test_browser_keepalive_reuses_tls_connection(self):
+        server = self.start_browser()
+        # One-shot session handshake (always closes) to obtain the session cookie.
+        with contextlib.closing(http.client.HTTPSConnection(
+                bridge.HOST, server.server_port, timeout=4, context=self.trust)) as conn:
+            conn.request("GET", bridge.BROWSER_SESSION, headers={"Authorization": "Bearer " + self.token})
+            resp = conn.getresponse()
+            resp.read()
+            self.assertEqual(resp.status, 204)
+            cookie = resp.getheader("Set-Cookie").split(";")[0]
+        # Two API requests on one connection must share a single TLS socket instead
+        # of paying a fresh BLE open + TLS handshake for each (the page-switch cost).
+        with contextlib.closing(http.client.HTTPSConnection(
+                bridge.HOST, server.server_port, timeout=4, context=self.trust)) as conn:
+            conn.request("GET", bridge.STATE, headers={"Cookie": cookie})
+            first = conn.getresponse()
+            first.read()
+            self.assertEqual(first.status, 200)
+            self.assertEqual(first.getheader("Connection"), "keep-alive")
+            sock = conn.sock
+            conn.request("GET", bridge.STATE, headers={"Cookie": cookie})
+            second = conn.getresponse()
+            second.read()
+            self.assertEqual(second.status, 200)
+            self.assertIs(conn.sock, sock)
+
+    def test_browser_errors_close_connection(self):
+        server = self.start_browser()
+        with contextlib.closing(http.client.HTTPSConnection(
+                bridge.HOST, server.server_port, timeout=4, context=self.trust)) as conn:
+            conn.request("GET", bridge.STATE)  # no session cookie -> 401
+            resp = conn.getresponse()
+            resp.read()
+            self.assertEqual(resp.status, 401)
+            self.assertEqual(resp.getheader("Connection"), "close")
+
     def test_uncached_and_unknown_routing(self):
         self.mode, self.trace_ok = "uncached", False
         self.start_bridge()

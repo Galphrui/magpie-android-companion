@@ -28,6 +28,7 @@ import android.view.WindowManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
@@ -41,6 +42,7 @@ import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
 import java.io.IOException;
 import java.text.DateFormat;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
@@ -87,6 +89,14 @@ public final class MainActivity extends ComponentActivity {
     private Runnable bluetoothPairingExpiry, bluetoothRetryTask;
     private String bluetoothStatus = "蓝牙未连接";
     private boolean scanAfterBluetoothReady;
+    private final ArrayDeque<String> loadLog = new ArrayDeque<>();
+    private TextView loadingLog;
+    private ProgressBar loadingOverall, loadingStage;
+    private TextView loadingPercent, loadingStageLabel;
+    private final java.util.HashMap<String, Integer> stagePercent = new java.util.HashMap<>();
+    private boolean summaryStageLogged;
+    private static final String[] STAGE_NAMES = {"配对", "通道", "摘要", "界面"};
+    private static final int[] STAGE_WEIGHTS = {25, 10, 10, 55};
 
     @Override protected void onCreate(Bundle state) {
         boolean night = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
@@ -114,6 +124,10 @@ public final class MainActivity extends ComponentActivity {
             scrollY = state.getInt("scroll");
             summarySelected = state.getBoolean("summary");
             scanAfterBluetoothReady = state.getBoolean("scanAfterBluetoothReady");
+        }
+        // A USB handoff can cold-start the activity, bypassing onNewIntent.
+        if (isUsbPairUpdate(getIntent())) {
+            getPreferences(MODE_PRIVATE).edit().putBoolean(USE_BLUETOOTH, false).apply();
         }
         getWindow().setAttributes(cutoutLayout(getWindow().getAttributes()));
         WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
@@ -200,12 +214,14 @@ public final class MainActivity extends ComponentActivity {
             return;
         }
         bluetoothStatus = "正在启动蓝牙配对";
+        addLoadLog("STAGE 配对 0");
         int generation = bluetoothGeneration;
         try {
             bluetoothTunnel = BluetoothTunnel.start(this, pairing.serviceId, pairing.token(),
                     message -> {
                         if (generation != bluetoothGeneration) return;
                         bluetoothStatus = message;
+                        if ("蓝牙已配对".equals(message)) addLoadLog("STAGE 配对 100");
                         // A tunnel can fail before a peer connects, so no connection
                         // callback is emitted. Reclaim that closed instance and retry
                         // with the same QR instead of leaving the UI permanently stuck.
@@ -232,6 +248,10 @@ public final class MainActivity extends ComponentActivity {
                         if (active && desktop == null && (bluetoothTunnel == null || !bluetoothTunnel.isPaired())) {
                             updateLink(false, bluetoothStatus);
                         }
+                    },
+                    line -> {
+                        if (generation != bluetoothGeneration) return;
+                        addLoadLog(line);
                     },
                     connected -> onBluetoothState(generation, pairing, connected));
             tunnelPairing = pairing;
@@ -371,6 +391,56 @@ public final class MainActivity extends ComponentActivity {
     private void showConnectionMessage(String message) {
         Toast.makeText(this, message, Toast.LENGTH_LONG).show();
     }
+    private void addLoadLog(String line) {
+        if (line == null || line.isEmpty()) return;
+        if (line.startsWith("STAGE ")) {
+            String[] parts = line.split(" ");
+            if (parts.length >= 3) {
+                try {
+                    stagePercent.put(parts[1], Math.max(0, Math.min(100, Integer.parseInt(parts[2]))));
+                } catch (NumberFormatException ignored) {
+                }
+            }
+        }
+        String stamped = DateFormat.getTimeInstance(DateFormat.MEDIUM).format(new Date()) + " " + line;
+        loadLog.addLast(stamped);
+        while (loadLog.size() > 30) loadLog.removeFirst();
+        if (loadingLog != null && loadingLog.getParent() != null) {
+            StringBuilder joined = new StringBuilder();
+            for (String item : loadLog) joined.append(item).append('\n');
+            loadingLog.setText(joined.toString().trim());
+        }
+        refreshLoadingOverlay();
+    }
+
+    private int overallPercent() {
+        int total = 0;
+        for (int i = 0; i < STAGE_NAMES.length; i++) {
+            Integer percent = stagePercent.get(STAGE_NAMES[i]);
+            total += STAGE_WEIGHTS[i] * (percent == null ? 0 : percent) / 100;
+        }
+        return Math.max(0, Math.min(100, total));
+    }
+
+    private String currentStageName() {
+        for (String name : STAGE_NAMES) {
+            Integer percent = stagePercent.get(name);
+            if (percent != null && percent < 100) return name;
+        }
+        return "界面";
+    }
+
+    private void refreshLoadingOverlay() {
+        if (loadingOverall == null || loadingOverall.getParent() == null) return;
+        int overall = overallPercent();
+        loadingOverall.setProgress(overall);
+        loadingPercent.setText(overall + "%");
+        String current = currentStageName();
+        Integer percent = stagePercent.get(current);
+        if (percent == null) percent = 0;
+        loadingStage.setProgress(percent);
+        loadingStageLabel.setText(current + " " + percent + "%");
+    }
     private void usePairing(String code, String origin) {
         if (paired != null && pairedOrigin.equals(origin) && paired.matchesPairing(code)) return;
         pairedOrigin = origin;
@@ -419,12 +489,20 @@ public final class MainActivity extends ComponentActivity {
             else showConnectionMessage("请开启手机蓝牙后再连接");
         }
     }
+    private boolean isUsbPairUpdate(Intent intent) {
+        return intent != null && (getPackageName() + UsbPairingProvider.ACTION_USB_PAIR_UPDATED)
+                .equals(intent.getAction());
+    }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent); setIntent(intent);
-        if ((getPackageName() + UsbPairingProvider.ACTION_USB_PAIR_UPDATED).equals(intent.getAction()) && !usesBluetooth()) {
-            stopStream(); loadPairing();
-            if (desktopFailed) attemptedDesktop = null;
-            snapshot = null; sampledAt = 0; displayKey = ""; connect();
+        if (isUsbPairUpdate(intent)) {
+            // A host-side ADB handoff is authoritative even when Bluetooth was
+            // previously selected. Keep saved BLE credentials for later, but
+            // immediately switch this session to the newly imported USB pairing.
+            clearBluetoothRecord();
+            pendingBluetooth = null;
+            getPreferences(MODE_PRIVATE).edit().putBoolean(USE_BLUETOOTH, false).apply();
+            resetConnection();
         }
     }
     @Override public void onConfigurationChanged(Configuration config) {
@@ -464,9 +542,41 @@ public final class MainActivity extends ComponentActivity {
     private void openDesktop() {
         if (desktop != null || !hasDesktopPairing()) return;
         attemptedDesktop = paired; desktopFailed = false; summarySelected = false;
-        TextView loading = label("正在加载电脑界面…", 16, text, true);
+        LinearLayout loading = new LinearLayout(this);
+        loading.setOrientation(LinearLayout.VERTICAL);
         loading.setGravity(Gravity.CENTER);
+        padding(loading, 22, 8);
+        TextView loadingTitle = label("正在加载电脑界面…", 16, text, true);
+        loadingTitle.setGravity(Gravity.CENTER);
+        loading.addView(loadingTitle, lp(-1, -2));
+        gap(loading, 12);
+        loadingPercent = label("0%", 20, text, true);
+        loadingPercent.setGravity(Gravity.CENTER);
+        loading.addView(loadingPercent, lp(-1, -2));
+        gap(loading, 4);
+        loadingOverall = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        loadingOverall.setMax(100);
+        loadingOverall.setProgress(0);
+        loading.addView(loadingOverall, lp(-1, dp(4)));
+        gap(loading, 10);
+        loadingStageLabel = label("配对 0%", 13, muted, false);
+        loadingStageLabel.setGravity(Gravity.CENTER);
+        loading.addView(loadingStageLabel, lp(-1, -2));
+        gap(loading, 4);
+        loadingStage = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        loadingStage.setMax(100);
+        loadingStage.setProgress(0);
+        loading.addView(loadingStage, lp(-1, dp(3)));
+        gap(loading, 10);
+        loadingLog = label("", 12, muted, false);
+        loadingLog.setTextIsSelectable(true);
+        loadingLog.setLineSpacing(dp(2), 1);
+        StringBuilder joined = new StringBuilder();
+        for (String item : loadLog) joined.append(item).append('\n');
+        loadingLog.setText(joined.toString().trim());
+        loading.addView(loadingLog, lp(-1, -2));
         loading.setBackgroundColor(bg);
+        refreshLoadingOverlay();
         try {
             desktop = new DesktopPage(this, paired, () -> loading.setVisibility(View.GONE), () -> showSummary(true));
         } catch (RuntimeException error) {
@@ -536,6 +646,11 @@ public final class MainActivity extends ComponentActivity {
                         if (stream != this || !active) return;
                         displayKey = ""; snapshot = value; sampledAt = System.currentTimeMillis();
                         boolean ready = value.optBoolean("upstreamAvailable", false);
+                        if (!summaryStageLogged) {
+                            summaryStageLogged = true;
+                            addLoadLog("STAGE 摘要 100");
+                            addLoadLog("摘要同步完成");
+                        }
                         updateLink(true, transportName() + " 已连接" + (ready ? "" : " · 部分数据不可用"));
                     }); });
                 } catch (Exception error) {
@@ -650,6 +765,24 @@ public final class MainActivity extends ComponentActivity {
         String key = page + "|" + status + "|" + commandPending + "|" + orientation() + "|" + (snapshot == null ? "" : snapshot.toString()); if (key.equals(displayKey)) return; displayKey = key;
         int position = preserve ? scroll.getScrollY() : scrollY; scrollY = 0; content.removeAllViews(); content.addView(label(PAGES[page], 26, text, true)); gap(content, 7);
         String last = status; if (!live && sampledAt != 0) last += " · 最后收到 " + DateFormat.getTimeInstance(DateFormat.MEDIUM).format(new Date(sampledAt)); note(last);
+        if (paired != null && !live) {
+            note("总进度 " + overallPercent() + "% · " + currentStageName() + " " + (stagePercent.containsKey(currentStageName()) ? stagePercent.get(currentStageName()) : 0) + "%");
+            ProgressBar syncBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+            syncBar.setMax(100);
+            syncBar.setProgress(overallPercent());
+            content.addView(syncBar, lp(-1, dp(4)));
+            gap(content, 7);
+            if (!loadLog.isEmpty()) {
+                StringBuilder joined = new StringBuilder();
+                int skip = Math.max(0, loadLog.size() - 8);
+                int index = 0;
+                for (String item : loadLog) {
+                    if (index++ < skip) continue;
+                    joined.append(item).append('\n');
+                }
+                note(joined.toString().trim());
+            }
+        }
         if (hasDesktopPairing() && (usesBluetooth() || desktopFailed || page == 3)) {
             if (desktopFailed) note("电脑界面暂不可用。确认电脑上的 Magpie 和连接服务正在运行后重试。");
             content.addView(button(desktopFailed ? "重试电脑界面" : "打开完整电脑界面", true, this::openDesktop), lp(-1, -2));

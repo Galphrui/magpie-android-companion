@@ -115,8 +115,8 @@ def connect(adb, signer, serial, credential, temp_dir, ports=(SUMMARY_PORT,)):
         response = execute(base + ['shell'], data=command)
         if not re.search(r'\bresult=paired\b', response):
             raise RuntimeError('Android did not acknowledge the USB credential import.')
-        response = execute(base + ['shell', 'am', 'start', '-W', '-n', COMPONENT,
-                                   '-a', PKG + '.USB_PAIR_UPDATED'])
+        response = execute(base + ['shell', 'am', 'start', '-W', '--activity-clear-top',
+                                   '-n', COMPONENT, '-a', PKG + '.USB_PAIR_UPDATED'])
         if not re.search(r'^Status: ok\s*$', response, re.M):
             raise RuntimeError('The installed app did not start successfully.')
         print('Signed companion identified and launched via USB; no manual phone pairing required.', flush=True)

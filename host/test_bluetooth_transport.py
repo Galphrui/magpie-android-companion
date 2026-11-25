@@ -21,11 +21,18 @@ class FakeGatt:
 
     def __init__(self):
         self.sent = asyncio.Queue()
+        self.logs = []
+        self.writes = []
 
     async def write_gatt_char(self, characteristic, frame, response):
-        assert characteristic == ble.RX and response and len(frame) <= 20
+        assert characteristic == ble.RX and len(frame) <= 20
         opcode, stream = ble.HEADER.unpack_from(frame)
-        await self.sent.put((opcode, stream, frame[3:]))
+        payload = frame[3:]
+        self.writes.append((opcode, response))
+        if opcode == ble.LOG:
+            self.logs.append((response, payload))
+            return
+        await self.sent.put((opcode, stream, payload))
 
 
 class BluetoothRelayTests(unittest.IsolatedAsyncioTestCase):
@@ -108,6 +115,42 @@ class BluetoothRelayTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.TimeoutError):
                 await session._connect_with_timeout(None, None)
         self.assertTrue(cancelled.is_set())
+
+    async def test_authenticated_pong_bypasses_full_stream_dispatch_queue(self):
+        self.relay.authenticated = True
+        self.relay.awaiting_pong = True
+        for _ in range(self.relay.frames.maxsize):
+            self.relay.frames.put_nowait(ble.HEADER.pack(ble.DATA, 1) + b"x")
+        self.send_phone(ble.PONG)
+        self.assertTrue(self.relay.pong.is_set())
+        self.assertFalse(self.relay.stopped)
+        self.assertTrue(self.relay.frames.full())
+        self.assertFalse(self.relay.awaiting_pong)
+
+    async def test_stale_authenticated_pong_is_discarded(self):
+        self.relay.authenticated = True
+        self.send_phone(ble.PONG)
+        self.assertFalse(self.relay.pong.is_set())
+        self.assertFalse(self.relay.stopped)
+        self.assertTrue(self.relay.frames.empty())
+
+    async def test_data_uses_write_without_response_and_control_uses_response(self):
+        await self.relay.send(ble.DATA, 1, b"d" * self.relay.payload_size)
+        await self.relay.send(ble.PING)
+        data_flags = [response for opcode, response in self.client.writes if opcode == ble.DATA]
+        ping_flags = [response for opcode, response in self.client.writes if opcode == ble.PING]
+        self.assertEqual(data_flags, [False])
+        self.assertEqual(ping_flags, [True])
+
+    async def test_log_messages_are_chunked_and_terminated(self):
+        self.relay.authenticated = True
+        text = "蓝牙传输测试消息" * 6
+        await self.relay._send_log(text)
+        self.assertTrue(self.client.logs)
+        self.assertTrue(all(response for response, _ in self.client.logs))
+        payloads = [payload for _, payload in self.client.logs]
+        self.assertEqual(payloads[-1], b"")
+        self.assertEqual(b"".join(payloads[:-1]).decode("utf-8"), text)
 
     async def test_heartbeat_disconnects_when_phone_stops_responding(self):
         with patch.object(ble, "HEARTBEAT_INTERVAL", 0), patch.object(ble, "HEARTBEAT_TIMEOUT", 0.1):

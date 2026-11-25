@@ -2,12 +2,14 @@
 import importlib.util
 import json
 import os
+import plistlib
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -21,10 +23,54 @@ def load(name, file):
 
 env = load('mac_env', ROOT / 'tools/configure_mac_env.py')
 usb = load('usb_connect', ROOT / 'tools/usb_connect.py')
+auto_usb = load('usb_auto_connect', ROOT / 'tools/install_usb_agent.py')
+asset_cache = load('web_asset_cache', ROOT / 'tools/build_web_asset_cache.py')
 bridge = load('magpie_bridge', ROOT / 'host/bridge.py')
 
 
 class HostToolsTests(unittest.TestCase):
+    def test_usb_launch_agent_runs_supervisor_and_retries_detection(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder) / 'user home'
+            project = Path(folder) / 'Magpie project'
+            project.mkdir()
+            expected = auto_usb.document(project, home)
+            self.assertEqual(expected['ProgramArguments'],
+                             ['/bin/bash', str(project.resolve() / 'tools/usb_start.sh'), '--full-browser'])
+            self.assertTrue(expected['RunAtLoad'])
+            self.assertEqual(expected['StartInterval'], 60)
+            target = auto_usb.write_agent(project, home)
+            with target.open('rb') as source:
+                self.assertEqual(plistlib.load(source), expected)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_web_asset_builder_includes_cacheable_static_resource_types(self):
+        for path in ('app.js', 'bundle.mjs', 'icons/logo.svg', 'fonts/ui.woff2', 'images/bg.avif'):
+            with self.subTest(path=path):
+                self.assertIsNotNone(asset_cache.ASSET_PATH.fullmatch(path))
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / 'upstream'
+            (root / 'internal/gui/assets/icons').mkdir(parents=True)
+            (root / 'internal/gui/assets/fonts').mkdir(parents=True)
+            (root / 'LICENSE').write_text('test license')
+            (root / 'internal/gui/assets/app.js').write_text('boot();')
+            (root / 'internal/gui/assets/icons/logo.svg').write_text('<svg/>')
+            (root / 'internal/gui/assets/fonts/ui.woff2').write_bytes(b'font-data')
+            (root / 'internal/gui/assets/readme.txt').write_text('not a browser asset')
+            subprocess.run(['git', '-C', str(root), 'init', '-q'], check=True)
+            subprocess.run(['git', '-C', str(root), 'config', 'user.email', 'test@example.invalid'], check=True)
+            subprocess.run(['git', '-C', str(root), 'config', 'user.name', 'Test'], check=True)
+            subprocess.run(['git', '-C', str(root), 'add', '.'], check=True)
+            subprocess.run(['git', '-C', str(root), 'commit', '-qm', 'fixture'], check=True)
+            output = Path(folder) / 'web-assets.zip'
+            self.assertEqual(asset_cache.build(root, output), 3)
+            with ZipFile(output) as archive:
+                names = archive.namelist()
+                self.assertTrue(any(name.endswith('/app.js') for name in names))
+                self.assertTrue(any(name.endswith('/icons/logo.svg') for name in names))
+                self.assertTrue(any(name.endswith('/fonts/ui.woff2') for name in names))
+                self.assertFalse(any(name.endswith('readme.txt') for name in names))
+
     def test_profile_preserves_other_settings_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as folder:
             home = Path(folder)
@@ -84,6 +130,24 @@ class HostToolsTests(unittest.TestCase):
                 path.write_text(json.dumps(value))
                 with self.subTest(value=value), patch.object(bridge, 'browser_config_candidates', return_value=(path,)), self.assertRaises(ValueError):
                     bridge.read_auto_key()
+
+    def test_usb_handoff_clears_scanner_and_reuses_main_activity(self):
+        calls = []
+        def fake(argv, **kwargs):
+            calls.append((argv, kwargs))
+            if 'reverse' in argv and '--list' in argv:
+                return ''
+            if kwargs.get('data'):
+                return 'result=paired'
+            if 'am' in argv:
+                return 'Status: ok\n'
+            return ''
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(usb, 'verify_installed'), patch.object(usb, 'execute', side_effect=fake):
+                usb.connect('/adb', '/signer', 'phone', 'a' * 64 + ':' + 'B' * 43, folder)
+        launch = next(argv for argv, _ in calls if 'am' in argv)
+        self.assertIn('--activity-clear-top', launch)
+        self.assertIn(usb.PKG + '.USB_PAIR_UPDATED', launch)
 
     def test_usb_pair_provider_failure_never_launches_app(self):
         calls = []

@@ -1,8 +1,18 @@
 #!/bin/bash
+# 双击启动 Mac 版「Magpie 蓝牙配置」窗口。
+# 首次运行会在用户目录创建 Python 环境并安装依赖；之后直接打开窗口。
 set -euo pipefail
+
 project="$(cd "$(dirname "$0")/.." && pwd)"
 requirements="$project/host/requirements-bluetooth.txt"
 venv="${HOME:?}/Library/Application Support/Magpie Android Companion/ble-venv"
+
+pause_on_error() {
+  printf '\n启动失败：%s\n' "$1" >&2
+  printf '请截图以上信息。按回车键关闭此窗口…' >&2
+  read -r _ || true
+  exit 1
+}
 
 suitable_python() {
   "$1" -c 'import sys, tkinter; from pathlib import Path; binary = Path(sys.base_prefix, "Resources/Python.app/Contents/MacOS/Python"); sys.exit(sys.version_info < (3, 10) or not binary.is_file())' >/dev/null 2>&1
@@ -14,21 +24,21 @@ if ! suitable_python "$venv/bin/python"; then
     python=/Library/Frameworks/Python.framework/Versions/Current/bin/python3
   fi
   if ! suitable_python "$python"; then
-    printf '%s\n' '请安装带 Tk 的 Python 3.10 或更新版本（例如 python.org 的 macOS 安装包），然后重新打开此脚本。' >&2
-    exit 1
+    pause_on_error '请先安装带 Tk 的 Python 3.10 或更新版本（python.org 的 macOS 安装包），然后重新打开本程序。'
   fi
-  "$python" -m venv "$venv"
+  "$python" -m venv "$venv" || pause_on_error '无法创建 Python 环境。'
 fi
 
 marker="$venv/magpie-requirements.txt"
 if ! cmp -s "$requirements" "$marker"; then
-  "$venv/bin/python" -m pip install --disable-pip-version-check -r "$requirements"
+  "$venv/bin/python" -m pip install --disable-pip-version-check -r "$requirements" \
+    || pause_on_error '依赖下载失败。请检查网络后重试。'
   cp "$requirements" "$marker"
 fi
+
 app="$(dirname "$venv")/Magpie Bluetooth.app"
-# macOS attributes Bluetooth access to the native bundle. Launching a shell
-# wrapper would leave Python's app responsible for the system prompt.
-"$venv/bin/python" - "$app" <<'PY'
+# macOS 把蓝牙权限归到原生 App 包上；用 shell 包装直接跑 Python 会导致系统授权归属错误。
+"$venv/bin/python" - "$app" <<'PY' || pause_on_error '无法生成 Magpie Bluetooth.app。'
 from pathlib import Path
 import os
 import plistlib
@@ -64,4 +74,5 @@ if (not binary.is_file() or not plist.is_file() or plist.read_bytes() != metadat
     plist.write_bytes(metadata)
     subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(app)], check=True)
 PY
+
 exec /usr/bin/open -a "$app" --args -B -s "$project/host/configure.py"

@@ -9,8 +9,8 @@ if [[ ! -f "$KEYSTORE" ]]; then
   echo "Keystore missing at $KEYSTORE; obtain it from its protected backup." >&2
   exit 1
 fi
-if ! command -v adb >/dev/null || ! command -v java >/dev/null || [[ ! -x "$PROJECT/gradlew" ]]; then
-  echo "Run tools/setup_mac_android.sh in Terminal on the Mac to configure ADB, Java, and the Android SDK." >&2
+if ! command -v adb >/dev/null || ! command -v java >/dev/null || ! command -v python3 >/dev/null || [[ ! -x "$PROJECT/gradlew" ]]; then
+  echo "Run tools/setup_mac_android.sh in Terminal on the Mac to configure ADB, Python, Java, and the Android SDK." >&2
   exit 1
 fi
 if [[ "$(uname -s)" != Darwin ]]; then
@@ -81,4 +81,5 @@ if ! grep -Eq '^Status: ok[[:space:]]*$' <<< "$START" || ! adb -s "$SERIAL" shel
   echo "APK installation succeeded, but app launch could not be verified." >&2
   exit 1
 fi
+python3 -I "$PROJECT/tools/install_usb_agent.py" --project "$PROJECT"
 printf '\nRelease APK installed and launched: %s\nDevice: %s\nCertificate SHA-256: %s\n' "$APK" "$SERIAL" "$ACTUAL"

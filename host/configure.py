@@ -136,6 +136,7 @@ class ConfigWindow:
         self.failed = False
         self.manual_stop = False
         self.qrcode = qrcode
+        self.tk = tk
         self.qr_matrix = None
         self.connected = False
         self.worker_generation = 0
@@ -305,11 +306,11 @@ class ConfigWindow:
         if not value:
             return
         self.log_text.configure(state="normal")
-        self.log_text.insert(tk.END, time.strftime("%H:%M:%S") + "  " + value + "\n")
+        self.log_text.insert(self.tk.END, time.strftime("%H:%M:%S") + "  " + value + "\n")
         lines = int(self.log_text.index("end-1c").split(".")[0])
         if lines > 240:
             self.log_text.delete("1.0", f"{lines - 200}.0")
-        self.log_text.see(tk.END)
+        self.log_text.see(self.tk.END)
         self.log_text.configure(state="disabled")
 
 
